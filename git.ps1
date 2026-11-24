@@ -6,10 +6,38 @@
 # ==============================================================================
 
 # -------------------------- CONFIGURATION --------------------------
-$BaseDir = "$env:USERPROFILE\.git-switch"
-$ProfilesFile = "$BaseDir\profiles.json"
-$SSHDir = "$env:USERPROFILE\.ssh"
-$SSHConfigFile = "$SSHDir\config"
+$IsWinOS = ($env:OS -eq "Windows_NT") -or ($PSVersionTable.PSVersion.Major -lt 6) -or $IsWindows
+$HomeDir = if ($IsWinOS -and $env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+$BaseDir = Join-Path $HomeDir ".git-switch"
+$ProfilesFile = Join-Path $BaseDir "profiles.json"
+$SSHDir = Join-Path $HomeDir ".ssh"
+$SSHConfigFile = Join-Path $SSHDir "config"
+
+function Wait-KeyPress {
+    Read-Host "Press Enter to continue..." | Out-Null
+}
+
+function Open-Target {
+    param([string]$Target)
+    if ($IsWinOS) {
+        Start-Process $Target
+    } elseif ($IsMacOS) {
+        & open $Target
+    } else {
+        & xdg-open $Target
+    }
+}
+
+function Copy-TextToClipboard {
+    param([string]$Text)
+    if (Get-Command Set-Clipboard -ErrorAction SilentlyContinue) {
+        Set-Clipboard -Value $Text
+    } elseif ($IsMacOS -and (Get-Command pbcopy -ErrorAction SilentlyContinue)) {
+        $Text | & pbcopy
+    } else {
+        throw "No clipboard utility available."
+    }
+}
 
 
 # -------------------------- HELPER: UI & BOX DRAWING --------------------------
@@ -105,12 +133,55 @@ function Get-Git-Current {
     }
 }
 
+function Test-InsideGitRepo {
+    $res = git rev-parse --is-inside-work-tree 2>$null
+    return ($LASTEXITCODE -eq 0 -and $res -eq "true")
+}
+
+function Test-CommitSigningEnabled {
+    $gSign = git config --global commit.gpgsign 2>$null
+    $lSign = if (Test-InsideGitRepo) { git config --local commit.gpgsign 2>$null } else { $null }
+    return ($gSign -eq "true" -or $lSign -eq "true")
+}
+
+function Sync-Git-Identity {
+    param([string]$UserName, [string]$UserEmail, [string]$KeyPath)
+
+    # 1. Global identity
+    git config --global user.name "$UserName"
+    git config --global user.email "$UserEmail"
+
+    # 2. Local repo identity (prevents stale .git/config from overriding global)
+    $inRepo = Test-InsideGitRepo
+    if ($inRepo) {
+        git config --local user.name "$UserName"
+        git config --local user.email "$UserEmail"
+        Write-Color "   [✔] Synced local repo user.name & user.email (.git/config)." -Color Green
+    }
+
+    # 3. Sync SSH commit signing key if signing is enabled or already configured for SSH
+    if ($KeyPath -and (Test-Path "$KeyPath.pub")) {
+        $pubKey = "$KeyPath.pub"
+        $currFmt = git config --global gpg.format 2>$null
+        $currSKey = git config --global user.signingkey 2>$null
+        if ((Test-CommitSigningEnabled) -or ($currFmt -eq "ssh") -or (-not [string]::IsNullOrWhiteSpace($currSKey))) {
+            git config --global gpg.format ssh
+            git config --global user.signingkey "$pubKey"
+            if ($inRepo) {
+                git config --local gpg.format ssh
+                git config --local user.signingkey "$pubKey"
+            }
+            Write-Color "   [✔] Updated Git SSH signing key: $pubKey" -Color Green
+        }
+    }
+}
+
 # --- SSH LOGIC ---
 
 function Generate-SSH-Key {
     param($Email, $Alias)
     
-    $KeyPath = "$SSHDir\id_rsa_$Alias"
+    $KeyPath = Join-Path $SSHDir "id_rsa_$Alias"
     
     if (Test-Path $KeyPath) {
         Write-Color "  [!] SSH Key already exists for this alias. Using existing key." -Color Yellow
@@ -121,8 +192,12 @@ function Generate-SSH-Key {
     
     # Gọi ssh-keygen, passphase rỗng (-N "") để tự động hóa
     try {
-        # FIX: Dùng '""' (bao quanh bởi nháy đơn) để PowerShell truyền đúng chuỗi rỗng cho ssh-keygen
-        & ssh-keygen -t rsa -b 4096 -C "$Email" -f "$KeyPath" -N '""' | Out-Null
+        if ($IsWinOS) {
+            # FIX: Dùng '""' (bao quanh bởi nháy đơn) để Windows PowerShell truyền đúng chuỗi rỗng cho ssh-keygen
+            & ssh-keygen -t rsa -b 4096 -C "$Email" -f "$KeyPath" -N '""' | Out-Null
+        } else {
+            & ssh-keygen -t rsa -b 4096 -C "$Email" -f "$KeyPath" -N "" | Out-Null
+        }
         
         if ($LASTEXITCODE -eq 0) {
             Write-Color "  [✔] SSH Key generated successfully." -Color Green
@@ -354,7 +429,7 @@ function Add-Profile-Action {
     if (Test-Path $PubKeyPath) {
         $PubKeyContent = Get-Content $PubKeyPath -Raw
         try {
-            Set-Clipboard -Value $PubKeyContent
+            Copy-TextToClipboard -Text $PubKeyContent
             Write-Color "   [✔] Public Key copied to CLIPBOARD!" -Color Green
         } catch {
             Write-Color "   [!] Could not auto-copy. Please open .pub file manually." -Color Yellow
@@ -362,14 +437,15 @@ function Add-Profile-Action {
     }
 
     # 4. Hướng dẫn & Mở Browser
+    $PasteKey = if ($IsMacOS) { "Cmd+V" } else { "Ctrl+V" }
     Write-Host "`n   [ACTION REQUIRED]" -ForegroundColor Yellow
     Write-Host "   1. I will open GitHub SSH settings now." -ForegroundColor Gray
     Write-Host "   2. Click 'New SSH Key'." -ForegroundColor Gray
-    Write-Host "   3. Paste (Ctrl+V) the key into the box." -ForegroundColor Gray
+    Write-Host "   3. Paste ($PasteKey) the key into the box." -ForegroundColor Gray
     Write-Host "   4. Come back here and press ENTER." -ForegroundColor Gray
     
     Start-Sleep -Seconds 2
-    Start-Process "https://github.com/settings/ssh/new"
+    Open-Target "https://github.com/settings/ssh/new"
     
     Read-Host "`n   Press ENTER after you have added the key on GitHub..."
 
@@ -393,8 +469,7 @@ function Add-Profile-Action {
     # ==========================================================================
     $Curr = Get-Git-Current
     if ($Curr.Name -eq "Not Set" -or $Curr.Name -eq $null) {
-        git config --global user.name "$UName"
-        git config --global user.email "$UEmail"
+        Sync-Git-Identity -UserName $UName -UserEmail $UEmail -KeyPath $KeyPath
         Write-Color "   [INFO] Auto-set as Global Git Config (was previously unset)." -Color Cyan
     }
 }
@@ -427,9 +502,8 @@ function Switch-Profile-Action {
     
     Write-Color "`n   [INFO] Switching to '$($Selected.alias)'..." -Color Cyan
     
-    # 1. Change Global Config
-    git config --global user.name "$($Selected.userName)"
-    git config --global user.email "$($Selected.userEmail)"
+    # 1. Change Global & Local Config (+ SSH Signing Key if enabled)
+    Sync-Git-Identity -UserName $Selected.userName -UserEmail $Selected.userEmail -KeyPath $Selected.keyPath
     
     # 2. Update Repo URL (Local Override)
     Update-Repo-Url -Alias $Selected.alias
@@ -442,6 +516,9 @@ function Switch-Profile-Action {
     Write-Color "`n   [✔] Switched successfully!" -Color Green
     Write-Color "       Global User : $($Selected.userName)" -Color Gray
     Write-Color "       Global Email: $($Selected.userEmail)" -Color Gray
+    if (Test-InsideGitRepo) {
+        Write-Color "       Local Repo  : Synced to $($Selected.userName) <$($Selected.userEmail)>" -Color Gray
+    }
 }
 
 function Remove-Profile-Action {
@@ -491,37 +568,82 @@ function Remove-Profile-Action {
         Save-Profiles $NewProfiles
     }
 
-    # 4. Check & Clear Global Config
+    # 4. Check & Clear Global/Local Config and Signing Key
     $Curr = Get-Git-Current
-    if ($Curr.Name -eq $Removed.userName) {
-        git config --global --unset user.name
-        git config --global --unset user.email
-        Write-Color "   [INFO] Current Git config cleared because profile was removed." "Cyan"
+    if ($Curr.Name -eq $Removed.userName -or $Curr.Email -eq $Removed.userEmail) {
+        git config --global --unset user.name 2>$null
+        git config --global --unset user.email 2>$null
+        Write-Color "   [INFO] Current Global Git config cleared because profile was removed." "Cyan"
+    }
+    $currSKey = git config --global user.signingkey 2>$null
+    if ($Removed.keyPath -and $currSKey -eq "$($Removed.keyPath).pub") {
+        git config --global --unset user.signingkey 2>$null
+    }
+    if (Test-InsideGitRepo) {
+        $localEmail = git config --local user.email 2>$null
+        if ($localEmail -eq $Removed.userEmail) {
+            git config --local --unset user.name 2>$null
+            git config --local --unset user.email 2>$null
+            Write-Color "   [INFO] Local repo Git config cleared because profile was removed." "Cyan"
+        }
+        $localSKey = git config --local user.signingkey 2>$null
+        if ($Removed.keyPath -and $localSKey -eq "$($Removed.keyPath).pub") {
+            git config --local --unset user.signingkey 2>$null
+        }
     }
 
     Write-Color "   [✔] Profile removed successfully." "Green"
+}
+
+function Toggle-SSH-Signing {
+    if (Test-CommitSigningEnabled) {
+        git config --global commit.gpgsign false
+        if (Test-InsideGitRepo) { git config --local --unset commit.gpgsign 2>$null }
+        Write-Color "   [✔] SSH Commit Signing disabled (commit.gpgsign = false)." "Yellow"
+    } else {
+        git config --global gpg.format ssh
+        git config --global commit.gpgsign true
+        $Curr = Get-Git-Current
+        $Profiles = @(Load-Profiles)
+        $Matched = $Profiles | Where-Object { $_.userEmail -eq $Curr.Email -and $_.keyPath } | Select-Object -First 1
+        if ($Matched -and (Test-Path "$($Matched.keyPath).pub")) {
+            $pubKey = "$($Matched.keyPath).pub"
+            git config --global user.signingkey "$pubKey"
+            if (Test-InsideGitRepo) {
+                git config --local gpg.format ssh
+                git config --local user.signingkey "$pubKey"
+            }
+            Write-Color "   [✔] SSH Commit Signing enabled with key: $pubKey" "Green"
+        } else {
+            Write-Color "   [✔] SSH Commit Signing enabled (switch a profile to assign signing key)." "Green"
+        }
+        Write-Color "   [TIP] Add your .pub key on GitHub as Key type = 'Signing Key' for Verified badge." "Gray"
+    }
 }
 
 function Show-Settings-Action {
     Write-Host "`n"
     Draw-Header "SETTINGS & TOOLS"
 
+    $SignState = if (Test-CommitSigningEnabled) { "ON" } else { "OFF" }
     Write-Host "     [1] Open profiles.json (View/Edit DB)"
     Write-Host "     [2] Backup Profiles (Create snapshot)"
     Write-Host "     [3] Open .ssh folder (View Keys)"
+    Write-Host "     [4] Toggle SSH Commit Signing (Currently: $SignState)"
     Write-Host "     [0] Back"
     
     Draw-Sep
 
     $Opt = Read-Host "   Choose"
     switch ($Opt) {
-        "1" { Invoke-Item $ProfilesFile }
+        "1" { Open-Target $ProfilesFile }
         "2" { 
-            $Bak = "$BaseDir\backup_$(Get-Date -Format 'yyyyMMdd_HHmm').json"
+            $Bak = Join-Path $BaseDir "backup_$(Get-Date -Format 'yyyyMMdd_HHmm').json"
             Copy-Item $ProfilesFile $Bak
             Write-Color "   [✔] Backup created: $Bak" "Green"
         }
-        "3" { Invoke-Item $SSHDir }
+        "3" { Open-Target $SSHDir }
+        "4" { Toggle-SSH-Signing }
     }
 }
 
@@ -543,17 +665,41 @@ function Show-Banner {
     Write-Host "   » GIT PROFILE MANAGEMENT SYSTEM [v2.1]" -ForegroundColor White
     Draw-Sep
     
-    $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    
-    if ($IsAdmin) {
-        Write-Color "   [✔] STATUS: Running as Administrator" -Color Green
+    if ($IsWinOS) {
+        $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        
+        if ($IsAdmin) {
+            Write-Color "   [✔] STATUS: Running as Administrator" -Color Green
+        } else {
+            Write-Color "   [!] STATUS: Running as Standard User (Restrictions may apply)" -Color Yellow
+        }
     } else {
-        Write-Color "   [!] STATUS: Running as Standard User (Restrictions may apply)" -Color Yellow
+        $OsLabel = if ($IsMacOS) { "macOS" } else { "Linux" }
+        Write-Color "   [✔] STATUS: Running on $OsLabel ($env:USER)" -Color Green
     }
 
     Write-Host "   [●] CURRENT: " -NoNewline -ForegroundColor Cyan
     Write-Host "$($Curr.Name) " -NoNewline -ForegroundColor White
     Write-Host "<$($Curr.Email)>" -ForegroundColor DarkGray
+
+    if (Test-InsideGitRepo) {
+        $LocalEmail = git config --local user.email 2>$null
+        $LocalName = git config --local user.name 2>$null
+        if ($LocalEmail -and $LocalEmail -ne $Curr.Email) {
+            $DispName = if ($LocalName) { $LocalName } else { $Curr.Name }
+            Write-Color "   [!] LOCAL OVERRIDE: $DispName <$LocalEmail> (Switch to sync)" -Color Yellow
+        }
+    }
+
+    if (Test-CommitSigningEnabled) {
+        $SKey = git config --get user.signingkey 2>$null
+        if ($SKey) {
+            $KeyName = Split-Path $SKey -Leaf
+            Write-Color "   [✔] SSH SIGNING: ON ($KeyName)" -Color Green
+        } else {
+            Write-Color "   [!] SSH SIGNING: ON (no signing key set)" -Color Yellow
+        }
+    }
     Draw-Sep
 }
 
@@ -581,11 +727,11 @@ do {
     $Selection = Read-Host "  Choose an option (0-5)"
 
     switch ($Selection) {
-        "1" { Add-Profile-Action; Pause }
-        "2" { Switch-Profile-Action; Pause }
-        "3" { Remove-Profile-Action; Pause }
-        "4" { Show-Settings-Action; Pause }
-        "5" { Test-Connection-Action; Pause }  # <-- Mới thêm dòng này
+        "1" { Add-Profile-Action; Wait-KeyPress }
+        "2" { Switch-Profile-Action; Wait-KeyPress }
+        "3" { Remove-Profile-Action; Wait-KeyPress }
+        "4" { Show-Settings-Action; Wait-KeyPress }
+        "5" { Test-Connection-Action; Wait-KeyPress }
         "0" { $Running = $false; Write-Color "`n  Goodbye! 👋" "Magenta" }
         default { Write-Color "  Invalid option." "Red"; Start-Sleep -Milliseconds 500 }
     }
