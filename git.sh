@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# GIT PROFILE MANAGER - ULTIMATE EDITION (macOS / Linux)
-# Version: 2.2
+# GIT PROFILE MANAGER (macOS / Linux)
+# Version: 2.4
 # Author: nhatprx
-# Features: SSH Auto-Gen, HTTPS PAT Swap, Remote Sync, IDE Auth Sync
+# Features: 1-Click Switch, Global Multi-Repo Routing, SSH Signing, HTTPS PAT
 # ==============================================================================
 
 # -------------------------- CONFIGURATION --------------------------
 BASE_DIR="$HOME/.git-switch"
 PROFILES_FILE="$BASE_DIR/profiles.json"
 TOKENS_DIR="$BASE_DIR/tokens"
+ACTIVE_GITCONFIG="$BASE_DIR/active.gitconfig"
+ACTIVE_GITCONFIG_INCLUDE="~/.git-switch/active.gitconfig"
+NO_SSH_REWRITE_FLAG="$BASE_DIR/no-ssh-rewrite"
 SSH_DIR="$HOME/.ssh"
 SSH_CONFIG_FILE="$SSH_DIR/config"
 
 OS_TYPE="$(uname -s)"
+STATUS_MSG=""
+STATUS_COLOR=""
+NEED_PAUSE=false
 
 # -------------------------- COLORS --------------------------
 C_RESET='\033[0m'
@@ -187,46 +193,246 @@ sync_git_identity() {
     local user_name="$1"
     local user_email="$2"
     local key_path="$3"
+    local quiet="${4:-}"
 
     # 1. Global identity
     git config --global user.name "$user_name"
     git config --global user.email "$user_email"
 
-    # 2. Local repo identity (prevents stale .git/config from overriding global)
+    # 2. Clear stale local repo overrides so this repo inherits global switches cleanly
     if is_inside_git_repo; then
-        git config --local user.name "$user_name"
-        git config --local user.email "$user_email"
-        write_color "$C_GREEN" "   [✔] Synced local repo user.name & user.email (.git/config)."
+        git config --local --unset-all user.name 2>/dev/null || true
+        git config --local --unset-all user.email 2>/dev/null || true
+        git config --local --unset-all user.signingkey 2>/dev/null || true
+        git config --local --unset-all gpg.format 2>/dev/null || true
+        local l_sign_cur
+        l_sign_cur="$(git config --local commit.gpgsign 2>/dev/null || true)"
+        if [ "$l_sign_cur" != "false" ]; then
+            git config --local --unset-all commit.gpgsign 2>/dev/null || true
+        fi
 
         local local_ssh_cmd
         local_ssh_cmd="$(git config --local core.sshCommand 2>/dev/null || true)"
         if [ -n "$local_ssh_cmd" ]; then
-            write_color "$C_YELLOW" "   [!] Local core.sshCommand is set (${local_ssh_cmd}) and may override ~/.ssh/config."
+            write_color "$C_YELLOW" "   [!] Local core.sshCommand is set (${local_ssh_cmd}) and may override SSH key."
+            NEED_PAUSE=true
         fi
     fi
 
-    # 3. Auto-enable & sync SSH commit signing unless user explicitly disabled it (commit.gpgsign = false)
-    local pub_key="${key_path}.pub"
-    local g_sign l_sign
-    g_sign="$(git config --global commit.gpgsign 2>/dev/null || true)"
-    l_sign=""
-    if is_inside_git_repo; then
-        l_sign="$(git config --local commit.gpgsign 2>/dev/null || true)"
+    local global_ssh_cmd
+    global_ssh_cmd="$(git config --global core.sshCommand 2>/dev/null || true)"
+    if [ -n "$global_ssh_cmd" ]; then
+        write_color "$C_YELLOW" "   [!] Global core.sshCommand is set (${global_ssh_cmd}) and may override SSH key."
+        NEED_PAUSE=true
     fi
 
+    # 3. Auto-enable & sync global SSH commit signing unless user explicitly disabled it
+    local pub_key="${key_path}.pub"
+    local g_sign
+    g_sign="$(git config --global commit.gpgsign 2>/dev/null || true)"
+
     if [ -n "$key_path" ] && [ -f "$pub_key" ]; then
-        if [ "$g_sign" != "false" ] && [ "$l_sign" != "false" ]; then
+        if [ "$g_sign" != "false" ]; then
             git config --global gpg.format ssh
             git config --global user.signingkey "$pub_key"
             git config --global commit.gpgsign true
-            if is_inside_git_repo; then
-                git config --local gpg.format ssh
-                git config --local user.signingkey "$pub_key"
-                git config --local commit.gpgsign true
+            if [ "$quiet" != "quiet" ]; then
+                write_color "$C_GREEN" "   [✔] SSH Commit Signing active: ${pub_key}"
             fi
-            write_color "$C_GREEN" "   [✔] SSH Commit Signing active: ${pub_key}"
         fi
     fi
+}
+
+is_ssh_rewrite_enabled() {
+    [ ! -f "$NO_SSH_REWRITE_FLAG" ]
+}
+
+ensure_active_gitconfig_included() {
+    local existing
+    existing="$(git config --global --get-all include.path 2>/dev/null || true)"
+    if ! printf "%s\n" "$existing" | grep -Fxq "$ACTIVE_GITCONFIG_INCLUDE"; then
+        git config --global --add include.path "$ACTIVE_GITCONFIG_INCLUDE"
+    fi
+}
+
+clear_global_github_routing() {
+    mkdir -p "$BASE_DIR"
+    printf "# Managed by git-switch (inactive)\n" > "$ACTIVE_GITCONFIG"
+}
+
+sync_global_github_routing() {
+    local alias_name="$1"
+    local key_path="$2"
+
+    mkdir -p "$BASE_DIR"
+    if ! is_ssh_rewrite_enabled; then
+        clear_global_github_routing
+        return 0
+    fi
+
+    if [ -z "$alias_name" ] || [ -z "$key_path" ] || [ ! -f "$key_path" ]; then
+        clear_global_github_routing
+        return 0
+    fi
+
+    ensure_active_gitconfig_included
+
+    python3 - "$PROFILES_FILE" "$ACTIVE_GITCONFIG" "$alias_name" <<'PY'
+import json, re, sys
+
+profiles_file, out_file, active_alias = sys.argv[1:4]
+
+try:
+    with open(profiles_file, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        data = [data] if data else []
+except Exception:
+    data = []
+
+instead_of = [
+    "https://github.com/",
+    "https://www.github.com/",
+    "http://github.com/",
+    "git@github.com:",
+    "ssh://git@github.com/",
+    "ssh://git@github.com:22/",
+]
+
+seen = set(instead_of)
+for p in data:
+    if not isinstance(p, dict):
+        continue
+    other = (p.get("alias") or "").strip()
+    if other and other != active_alias:
+        for prefix in (
+            f"git@github.com-{other}:",
+            f"ssh://git@github.com-{other}/",
+            f"ssh://git@github.com-{other}:22/",
+        ):
+            if prefix not in seen:
+                instead_of.append(prefix)
+                seen.add(prefix)
+    gh_user = (p.get("githubUsername") or "").strip()
+    if gh_user and re.match(r"^[A-Za-z0-9-]+$", gh_user):
+        prefix = f"https://{gh_user}@github.com/"
+        if prefix not in seen:
+            instead_of.append(prefix)
+            seen.add(prefix)
+
+lines = [
+    f"# Managed by git-switch (Active: {active_alias})\n",
+    f'[url "git@github.com-{active_alias}:"]\n',
+]
+for prefix in instead_of:
+    lines.append(f"    insteadOf = {prefix}\n")
+
+with open(out_file, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+PY
+}
+
+ensure_active_routing_synced() {
+    local active_alias="$1"
+    if [ -z "$active_alias" ] || ! is_ssh_rewrite_enabled; then
+        return 0
+    fi
+
+    local active_key
+    active_key="$(get_profile_field_by_alias "$active_alias" "keyPath")"
+    if [ -z "$active_key" ] || [ ! -f "$active_key" ]; then
+        return 0
+    fi
+
+    local needs_sync=false
+    local existing_inc
+    existing_inc="$(git config --global --get-all include.path 2>/dev/null || true)"
+    if ! printf "%s\n" "$existing_inc" | grep -Fxq "$ACTIVE_GITCONFIG_INCLUDE"; then
+        needs_sync=true
+    elif [ ! -f "$ACTIVE_GITCONFIG" ]; then
+        needs_sync=true
+    elif ! grep -Fxq "# Managed by git-switch (Active: ${active_alias})" "$ACTIVE_GITCONFIG" 2>/dev/null; then
+        needs_sync=true
+    fi
+
+    if [ "$needs_sync" = "true" ]; then
+        ensure_ssh_ready "$active_alias" "$active_key"
+        sync_global_github_routing "$active_alias" "$active_key"
+    fi
+}
+
+ensure_ssh_ready() {
+    local alias_name="$1"
+    local key_path="$2"
+
+    if [ -z "$alias_name" ] || [ -z "$key_path" ] || [ ! -f "$key_path" ]; then
+        return 0
+    fi
+
+    # Self-heal ~/.ssh/config if Host entry is missing
+    if [ ! -f "$SSH_CONFIG_FILE" ] || ! grep -Eq "^[[:space:]]*Host[[:space:]]+github\.com-${alias_name}([[:space:]]|$)" "$SSH_CONFIG_FILE" 2>/dev/null; then
+        update_ssh_config "$alias_name" "$key_path" "quiet"
+    fi
+
+    # Silently ensure key is loaded in ssh-agent if agent is running
+    if [ -n "${SSH_AUTH_SOCK:-}" ] && command -v ssh-add >/dev/null 2>&1; then
+        if [ "$OS_TYPE" = "Darwin" ]; then
+            ssh-add --apple-use-keychain "$key_path" </dev/null >/dev/null 2>&1 || ssh-add "$key_path" </dev/null >/dev/null 2>&1 || true
+        else
+            ssh-add "$key_path" </dev/null >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+clean_repo_remote_for_routing() {
+    local alias_name="$1"
+    if ! is_inside_git_repo || ! is_ssh_rewrite_enabled; then
+        return 0
+    fi
+
+    local raw_url
+    raw_url="$(git config --local --get remote.origin.url 2>/dev/null || true)"
+    if [ -z "$raw_url" ]; then
+        return 0
+    fi
+
+    # 1. Strip embedded username from https://user@github.com/... so global insteadOf matches
+    local cleaned_url
+    cleaned_url="$(python3 - "$raw_url" "$alias_name" <<'PY'
+import re, sys
+url, active = sys.argv[1].strip(), sys.argv[2].strip()
+m = re.match(r"^https?://[^/@]+@github\.com(?::\d+)?/(.+)$", url, re.IGNORECASE)
+if m:
+    print(f"https://github.com/{m.group(1).rstrip('/')}")
+    sys.exit(0)
+# 2. If remote points to an orphaned/unknown github.com-<old>: alias, normalize to https://github.com/...
+m = re.match(r"^(?:ssh://)?git@github\.com-([^:/]+)(?::\d+)?[:/](.+)$", url, re.IGNORECASE)
+if m and m.group(1) != active:
+    # Only rewrite if effective URL did not already resolve to active
+    print(f"SSH_ALIAS_OTHER|{m.group(1)}|{m.group(2).rstrip('/')}")
+    sys.exit(0)
+print("")
+PY
+)"
+    if [ -z "$cleaned_url" ]; then
+        return 0
+    fi
+
+    case "$cleaned_url" in
+        SSH_ALIAS_OTHER\|*)
+            local eff_url
+            eff_url="$(git remote get-url origin 2>/dev/null || true)"
+            local rinfo rtype rpath ralias
+            rinfo="$(classify_github_remote "$eff_url")"
+            IFS='|' read -r rtype rpath ralias <<< "$rinfo"
+            if [ "$ralias" != "$alias_name" ] && [ -n "$rpath" ]; then
+                git remote set-url origin "https://github.com/${rpath}"
+            fi
+            ;;
+        https://github.com/*)
+            git remote set-url origin "$cleaned_url"
+            ;;
+    esac
 }
 
 fix_unpushed_commits_action() {
@@ -273,6 +479,7 @@ fix_unpushed_commits_action() {
         return 0
     fi
 
+    NEED_PAUSE=true
     printf "\n"
     write_color "$C_YELLOW" "   [!] Found ${mismatch_count} unpushed commit(s) with different author or missing SSH signature."
     local do_fix=""
@@ -555,6 +762,7 @@ generate_ssh_key() {
 update_ssh_config() {
     local alias_name="$1"
     local key_path="$2"
+    local quiet="${3:-}"
 
     # Remove existing entry with the same alias first to avoid duplicates
     remove_from_ssh_config "$alias_name" "quiet"
@@ -565,7 +773,7 @@ update_ssh_config() {
         printf "Host github.com-%s\n" "$alias_name"
         printf "    HostName github.com\n"
         printf "    User git\n"
-        printf "    IdentityFile %s\n" "$key_path"
+        printf "    IdentityFile \"%s\"\n" "$key_path"
         printf "    IdentitiesOnly yes\n"
         if [ "$OS_TYPE" = "Darwin" ]; then
             printf "    AddKeysToAgent yes\n"
@@ -574,7 +782,9 @@ update_ssh_config() {
     } >> "$SSH_CONFIG_FILE"
 
     chmod 600 "$SSH_CONFIG_FILE" 2>/dev/null || true
-    write_color "$C_GREEN" "  [✔] SSH Config updated (Host: github.com-${alias_name})."
+    if [ "$quiet" != "quiet" ]; then
+        write_color "$C_GREEN" "  [✔] SSH Config updated (Host: github.com-${alias_name})."
+    fi
 }
 
 remove_from_ssh_config() {
@@ -736,6 +946,7 @@ sync_https_credentials() {
     local alias_name="$1"
     local gh_user="$2"
     local fallback_user="$3"
+    local quiet="${4:-}"
     local effective_user="${gh_user:-$fallback_user}"
 
     if profile_has_token "$alias_name"; then
@@ -743,27 +954,33 @@ sync_https_credentials() {
         pat="$(load_profile_token "$alias_name")"
         if [ -n "$pat" ] && [ -n "$effective_user" ]; then
             apply_github_https_credential "$effective_user" "$pat" || rc=$?
-            if [ "$rc" -eq 0 ]; then
-                write_color "$C_GREEN" "   [✔] Swapped HTTPS credential for github.com (user: ${effective_user})."
-            elif [ "$rc" -eq 2 ]; then
-                if [ "$OS_TYPE" = "Darwin" ]; then
-                    write_color "$C_YELLOW" "   [!] No Git credential.helper configured. Run: git config --global credential.helper osxkeychain"
+            if [ "$quiet" != "quiet" ]; then
+                if [ "$rc" -eq 0 ]; then
+                    write_color "$C_GREEN" "   [✔] Swapped HTTPS credential for github.com (user: ${effective_user})."
+                elif [ "$rc" -eq 2 ]; then
+                    if [ "$OS_TYPE" = "Darwin" ]; then
+                        write_color "$C_YELLOW" "   [!] No Git credential.helper configured. Run: git config --global credential.helper osxkeychain"
+                    else
+                        write_color "$C_YELLOW" "   [!] No Git credential.helper configured. Run: git config --global credential.helper store"
+                    fi
                 else
-                    write_color "$C_YELLOW" "   [!] No Git credential.helper configured. Run: git config --global credential.helper store"
+                    write_color "$C_YELLOW" "   [!] Could not write HTTPS credential to Git credential helper."
                 fi
-            else
-                write_color "$C_YELLOW" "   [!] Could not write HTTPS credential to Git credential helper."
             fi
         fi
     else
         clear_github_https_credential
-        write_color "$C_GRAY" "   [INFO] Cleared cached HTTPS credential for github.com (no PAT saved for '${alias_name}')."
+        if [ "$quiet" != "quiet" ]; then
+            write_color "$C_GRAY" "   [INFO] Cleared cached HTTPS credential for github.com (no PAT saved for '${alias_name}')."
+        fi
     fi
 
     # Optional GitHub CLI (gh) sync if installed and githubUsername is set
     if [ -n "$gh_user" ] && command -v gh >/dev/null 2>&1; then
         if gh auth switch --user "$gh_user" >/dev/null 2>&1; then
-            write_color "$C_GREEN" "   [✔] Switched GitHub CLI (gh) account to: ${gh_user}"
+            if [ "$quiet" != "quiet" ]; then
+                write_color "$C_GREEN" "   [✔] Switched GitHub CLI (gh) account to: ${gh_user}"
+            fi
         fi
     fi
 }
@@ -843,80 +1060,57 @@ PY
 }
 
 get_active_profile_alias() {
-    local curr_email
+    local curr_name curr_email curr_skey
+    curr_name="$(get_git_current_name)"
     curr_email="$(get_git_current_email)"
-    python3 - "$PROFILES_FILE" "$curr_email" <<'PY'
-import json, sys
+    curr_skey="$(git config --global user.signingkey 2>/dev/null || true)"
+    python3 - "$PROFILES_FILE" "$curr_email" "$curr_name" "$curr_skey" "$ACTIVE_GITCONFIG" <<'PY'
+import json, re, sys
+
+profiles_file, curr_email, curr_name, curr_skey, active_cfg = sys.argv[1:6]
 try:
-    with open(sys.argv[1], "r", encoding="utf-8-sig") as f:
+    with open(profiles_file, "r", encoding="utf-8-sig") as f:
         data = json.load(f)
     if not isinstance(data, list):
         data = [data] if data else []
-    for p in data:
-        if isinstance(p, dict) and p.get("userEmail") == sys.argv[2]:
+except Exception:
+    sys.exit(0)
+
+email_matches = [p for p in data if isinstance(p, dict) and p.get("userEmail") == curr_email]
+if not email_matches:
+    sys.exit(0)
+
+# 1. Exact match on signing key
+if curr_skey:
+    for p in email_matches:
+        kp = (p.get("keyPath") or "").strip()
+        if kp and (curr_skey == f"{kp}.pub" or curr_skey == kp):
             print(p.get("alias", ""))
-            break
+            sys.exit(0)
+
+# 2. Match active alias recorded in active.gitconfig
+try:
+    with open(active_cfg, "r", encoding="utf-8") as f:
+        first_line = f.readline().strip()
+    m = re.match(r"^# Managed by git-switch \(Active:\s*([^)]+)\)$", first_line)
+    if m:
+        cfg_alias = m.group(1).strip()
+        for p in email_matches:
+            if p.get("alias") == cfg_alias:
+                print(cfg_alias)
+                sys.exit(0)
 except Exception:
     pass
+
+# 3. Match email + name
+for p in email_matches:
+    if p.get("userName") == curr_name:
+        print(p.get("alias", ""))
+        sys.exit(0)
+
+# 4. Fallback: first profile with matching email
+print(email_matches[0].get("alias", ""))
 PY
-}
-
-update_repo_url() {
-    local alias_name="$1"
-    local mode="${2:-prompt}"
-
-    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        return 0
-    fi
-
-    local current_url
-    current_url="$(git remote get-url origin 2>/dev/null || true)"
-    if [ -z "$current_url" ]; then
-        return 0
-    fi
-
-    printf "\n"
-    write_color "$C_CYAN" "   [INFO] Checking Repository Remote URL..."
-
-    local info remote_type repo_path current_ssh_alias
-    info="$(classify_github_remote "$current_url")"
-    IFS='|' read -r remote_type repo_path current_ssh_alias <<< "$info"
-
-    local target_ssh_url="git@github.com-${alias_name}:${repo_path}"
-
-    case "$remote_type" in
-        https)
-            write_color "$C_YELLOW" "   [!] Detected HTTPS remote: ${current_url}"
-            write_color "$C_GRAY" "       SSH keys (~/.ssh/config) are ignored for HTTPS remotes."
-            local do_convert="y"
-            if [ "$mode" != "auto" ]; then
-                read -r -p "   Convert remote to SSH alias (${target_ssh_url})? [Y/n]: " do_convert
-            fi
-            case "$do_convert" in
-                n|N|no|NO)
-                    write_color "$C_GRAY" "   [INFO] Keeping HTTPS remote."
-                    if ! profile_has_token "$alias_name"; then
-                        write_color "$C_YELLOW" "   [!] No HTTPS PAT saved for '${alias_name}'. Add one in Settings -> [5] Manage HTTPS Credentials."
-                    fi
-                    ;;
-                *)
-                    git remote set-url origin "$target_ssh_url"
-                    write_color "$C_GREEN" "   [✔] Converted HTTPS remote -> SSH alias: ${target_ssh_url}"
-                    ;;
-            esac
-            ;;
-        ssh_default|ssh_alias)
-            if [ "$target_ssh_url" != "$current_url" ]; then
-                git remote set-url origin "$target_ssh_url"
-                write_color "$C_GREEN" "   [✔] Updated SSH Remote URL to: ${target_ssh_url}"
-            else
-                write_color "$C_GRAY" "   [INFO] Remote URL already uses SSH alias: ${current_url}"
-            fi
-            ;;
-        *)
-            write_color "$C_GRAY" "   [INFO] Remote URL is not hosted on GitHub (${current_url})."
-            ;;
-    esac
 }
 
 # -------------------------- IDE GIT AUTH SYNC --------------------------
@@ -1168,77 +1362,6 @@ with open(path, "w", encoding="utf-8") as f:
 PY
 }
 
-show_ide_sync_hint() {
-    local mode="${1:-hint}"
-    local ide_lines need_hint=false ide_list=""
-    local -a pending_names=()
-    local -a pending_paths=()
-    local p_idx=0
-
-    ide_lines="$(detect_ide_settings_paths)"
-    if [ -n "$ide_lines" ]; then
-        while IFS='|' read -r ide_name settings_path; do
-            [ -z "$settings_path" ] && continue
-            local state
-            state="$(get_ide_git_auth_setting "$settings_path")"
-            if [ "$state" != "false" ]; then
-                need_hint=true
-                pending_names[$p_idx]="$ide_name"
-                pending_paths[$p_idx]="$settings_path"
-                p_idx=$((p_idx + 1))
-                if [ -z "$ide_list" ]; then
-                    ide_list="$ide_name"
-                else
-                    ide_list="${ide_list}, ${ide_name}"
-                fi
-            fi
-        done <<< "$ide_lines"
-    else
-        # Even if no known IDE path detected, show tip when remote is HTTPS
-        if is_inside_git_repo; then
-            local origin_url info rtype
-            origin_url="$(git remote get-url origin 2>/dev/null || true)"
-            if [ -n "$origin_url" ]; then
-                info="$(classify_github_remote "$origin_url")"
-                IFS='|' read -r rtype _ _ <<< "$info"
-                if [ "$rtype" = "https" ]; then
-                    need_hint=true
-                    ide_list="VS Code / Cursor / Antigravity"
-                fi
-            fi
-        fi
-    fi
-
-    if [ "$need_hint" = "true" ]; then
-        printf "\n"
-        write_color "$C_YELLOW" "   [TIP] IDE Sync (${ide_list}):"
-        write_color "$C_GRAY" "         IDE GitHub extension uses its own OAuth session for UI Push/Pull."
-        if [ "$mode" = "prompt" ] && [ "$p_idx" -gt 0 ]; then
-            local do_disable=""
-            read -r -p "   Disable \"github.gitAuthentication\" for ${ide_list} now so UI Push uses git-switch? [Y/n]: " do_disable
-            case "$do_disable" in
-                n|N|no|NO)
-                    write_color "$C_GRAY" "   [INFO] Skipped. You can configure this anytime in Settings -> [6] IDE Git Auth Sync."
-                    ;;
-                *)
-                    local k=0
-                    while [ "$k" -lt "$p_idx" ]; do
-                        if set_ide_git_auth_setting "${pending_paths[$k]}" "false"; then
-                            write_color "$C_GREEN" "   [✔] ${pending_names[$k]}: Set \"github.gitAuthentication\": false"
-                        else
-                            write_color "$C_RED" "   [X] ${pending_names[$k]}: Failed to update ${pending_paths[$k]}"
-                        fi
-                        k=$((k + 1))
-                    done
-                    ;;
-            esac
-        else
-            write_color "$C_GRAY" "         Set \"github.gitAuthentication\": false in IDE settings.json to share"
-            write_color "$C_GRAY" "         credentials with git-switch (or use Settings -> [6] IDE Git Auth Sync)."
-        fi
-    fi
-}
-
 test_github_connection() {
     local alias_name="$1"
     local host_alias="github.com-${alias_name}"
@@ -1249,7 +1372,13 @@ test_github_connection() {
     output="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T "git@${host_alias}" 2>&1 || true)"
 
     if printf "%s" "$output" | grep -qi "successfully authenticated"; then
-        write_color "$C_GREEN" "   [✔] Connection SUCCESS! You are authenticated."
+        local gh_login
+        gh_login="$(printf "%s" "$output" | sed -nE 's/.*Hi ([^!]+)!.*/\1/p' | head -n 1)"
+        if [ -n "$gh_login" ]; then
+            write_color "$C_GREEN" "   [✔] Connection SUCCESS! Authenticated as: ${gh_login}"
+        else
+            write_color "$C_GREEN" "   [✔] Connection SUCCESS! You are authenticated."
+        fi
         return 0
     else
         write_color "$C_RED" "   [X] Connection FAILED."
@@ -1268,31 +1397,22 @@ test_connection_action() {
         return
     fi
 
-    printf "\n"
-    draw_border_top 60 "$C_MAGENTA"
-    draw_line "TEST GITHUB CONNECTION" 60 "$C_MAGENTA" "$C_WHITE"
-    draw_separator 60 "$C_MAGENTA"
-
+    local -a items=()
     local i=0
     while [ "$i" -lt "$count" ]; do
-        local alias_name
+        local alias_name email_val
         alias_name="$(profile_get_field "$i" "alias")"
-        draw_line "  [$((i + 1))] ${alias_name}" 60 "$C_MAGENTA" "$C_WHITE"
+        email_val="$(profile_get_field "$i" "userEmail")"
+        items[$i]="$(printf "%-15s %s" "$alias_name" "$email_val")"
         i=$((i + 1))
     done
-    draw_border_bottom 60 "$C_MAGENTA"
+    items[$count]="← Back"
 
-    local choice
-    read -r -p "  Select ID to test (0 to cancel): " choice
-    case "$choice" in
-        ""|0|*[!0-9]*) return ;;
-    esac
-
-    local idx=$((choice - 1))
-    if [ "$idx" -lt 0 ] || [ "$idx" -ge "$count" ]; then
+    if ! tui_select_menu "TEST GITHUB CONNECTION" "${items[@]}" || [ "$TUI_CHOICE" -eq "$count" ]; then
         return
     fi
 
+    local idx="$TUI_CHOICE"
     local selected_alias selected_key
     selected_alias="$(profile_get_field "$idx" "alias")"
     selected_key="$(profile_get_field "$idx" "keyPath")"
@@ -1338,18 +1458,14 @@ add_profile_action() {
         fi
     done
 
-    local u_name u_email gh_user gh_pat
-    read -r -p "   Enter Git User Name (e.g. John Doe): " u_name
-    read -r -p "   Enter Git Email     (e.g. john@company.com): " u_email
+    local u_name u_email
+    read -r -p "   Git User Name (e.g. John Doe): " u_name
+    read -r -p "   Git Email     (e.g. john@company.com): " u_email
 
     if [ -z "$u_name" ] || [ -z "$u_email" ]; then
         write_color "$C_RED" "   [!] Name and Email are required."
         return
     fi
-
-    read -r -p "   Enter GitHub Username (optional, for HTTPS/gh sync, Enter to skip): " gh_user
-    read -r -s -p "   Enter GitHub HTTPS PAT (optional, hidden, Enter to skip): " gh_pat
-    printf "\n"
 
     # 1. Generate Key
     local key_path
@@ -1358,13 +1474,13 @@ add_profile_action() {
     fi
 
     # 2. Update SSH Config
-    update_ssh_config "$alias_name" "$key_path"
+    update_ssh_config "$alias_name" "$key_path" "quiet"
 
     # 3. Clipboard
     local pub_key_path="${key_path}.pub"
     if [ -f "$pub_key_path" ]; then
         if copy_to_clipboard "$pub_key_path"; then
-            write_color "$C_GREEN" "   [✔] Public Key copied to CLIPBOARD!"
+            write_color "$C_GREEN" "   [✔] Public Key copied to clipboard."
         else
             write_color "$C_YELLOW" "   [!] Could not auto-copy. Public key path: ${pub_key_path}"
         fi
@@ -1377,64 +1493,69 @@ add_profile_action() {
     fi
 
     printf "\n"
-    write_color "$C_YELLOW" "   [ACTION REQUIRED]"
-    write_color "$C_GRAY" "   1. I will open GitHub SSH settings now."
-    write_color "$C_GRAY" "   2. Paste (${paste_shortcut}) and add the key as 'Authentication Key' (for git push)."
-    write_color "$C_GRAY" "   3. (For Verified commits) Add the SAME key once more with Key type = 'Signing Key'."
-    write_color "$C_GRAY" "   4. Come back here and press ENTER."
+    write_color "$C_YELLOW" "   Add the key on GitHub (opening browser):"
+    write_color "$C_GRAY" "   1. Paste (${paste_shortcut}) as 'Authentication Key' (for git push)."
+    write_color "$C_GRAY" "   2. (Optional, for Verified badge) Add the same key as 'Signing Key'."
+    write_color "$C_GRAY" "   3. Return here and press ENTER."
 
-    sleep 2
+    sleep 1
     open_target "https://github.com/settings/ssh/new" || true
 
     printf "\n"
-    read -r -p "   Press ENTER after you have added the key on GitHub..." _
+    read -r -p "   Press ENTER after adding the key on GitHub..." _
 
     # 5. Test Connection
     test_github_connection "$alias_name" || true
 
-    # 6. Save Profile (& optional HTTPS PAT)
-    profile_add_json "$alias_name" "$u_name" "$u_email" "$key_path" "$gh_user"
-    if [ -n "$gh_pat" ]; then
-        save_profile_token "$alias_name" "$gh_pat"
-        write_color "$C_GREEN" "   [✔] Saved HTTPS PAT securely (chmod 600)."
-    fi
+    # 6. Save Profile
+    profile_add_json "$alias_name" "$u_name" "$u_email" "$key_path" ""
     printf "\n"
-    write_color "$C_GREEN" "   [✔] Profile '${alias_name}' saved successfully!"
+    write_color "$C_GREEN" "   [✔] Account '${alias_name}' saved!"
 
-    # Auto-set Global Config if currently unset
+    # Auto-activate if no global identity is set yet
     local curr_name
     curr_name="$(get_git_current_name)"
     if [ "$curr_name" = "Not Set" ]; then
-        sync_git_identity "$u_name" "$u_email" "$key_path"
-        sync_https_credentials "$alias_name" "$gh_user" "$u_name"
-        write_color "$C_CYAN" "   [INFO] Auto-set as Global Git Config (was previously unset)."
+        local new_count
+        new_count="$(profiles_count)"
+        apply_profile_index $((new_count - 1))
+    else
+        # Refresh global routing so the new alias is known
+        local active_alias active_key
+        active_alias="$(get_active_profile_alias)"
+        if [ -n "$active_alias" ]; then
+            active_key="$(get_profile_field_by_alias "$active_alias" "keyPath")"
+            sync_global_github_routing "$active_alias" "$active_key"
+        fi
     fi
 }
 
-switch_profile_action() {
+get_profile_field_by_alias() {
+    local alias_name="$1"
+    local field="$2"
+    python3 - "$PROFILES_FILE" "$alias_name" "$field" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        data = [data] if data else []
+    for p in data:
+        if isinstance(p, dict) and p.get("alias") == sys.argv[2]:
+            val = p.get(sys.argv[3], "")
+            print("" if val is None else val)
+            break
+except Exception:
+    pass
+PY
+}
+
+apply_profile_index() {
+    local idx="$1"
     local count
     count="$(profiles_count)"
-    if [ "$count" -eq 0 ]; then
-        printf "\n"
-        write_color "$C_YELLOW" "   [!] No profiles. Add one first."
-        return
-    fi
-
-    printf "\n"
-    draw_header "SWITCH PROFILE"
-    write_color "$C_DARKGRAY" "$(printf "     [%s] %-15s %s" "#" "ALIAS" "EMAIL")"
-    write_color "$C_WHITE" "$(profiles_list_table)"
-    draw_sep
-
-    local choice
-    read -r -p "   Choose ID (0 to cancel): " choice
-    case "$choice" in
-        ""|0|*[!0-9]*) return ;;
-    esac
-
-    local idx=$((choice - 1))
     if [ "$idx" -lt 0 ] || [ "$idx" -ge "$count" ]; then
-        return
+        return 1
     fi
 
     local selected_alias selected_name selected_email selected_key selected_gh_user
@@ -1444,36 +1565,27 @@ switch_profile_action() {
     selected_key="$(profile_get_field "$idx" "keyPath")"
     selected_gh_user="$(profile_get_field "$idx" "githubUsername")"
 
-    printf "\n"
-    write_color "$C_CYAN" "   [INFO] Switching to '${selected_alias}'..."
+    # 1. Global identity + SSH signing + clear stale local overrides
+    sync_git_identity "$selected_name" "$selected_email" "$selected_key" "quiet"
 
-    # 1. Change Global & Local Config (+ Auto SSH Signing Key)
-    sync_git_identity "$selected_name" "$selected_email" "$selected_key"
+    # 2. Self-heal ~/.ssh/config and ssh-agent
+    ensure_ssh_ready "$selected_alias" "$selected_key"
 
-    # 2. Swap/Clear HTTPS Credential (osxkeychain / Git credential helper / gh CLI)
-    sync_https_credentials "$selected_alias" "$selected_gh_user" "$selected_name"
+    # 3. Global multi-repo GitHub routing (~/.git-switch/active.gitconfig)
+    sync_global_github_routing "$selected_alias" "$selected_key"
 
-    # 3. Detect & Update Repo Remote URL (HTTPS vs SSH)
-    update_repo_url "$selected_alias"
+    # 4. Sync/clear HTTPS credentials & gh CLI silently
+    sync_https_credentials "$selected_alias" "$selected_gh_user" "$selected_name" "quiet"
 
-    # 4. Offer to update author & re-sign unpushed local commits
+    # 5. Clean embedded-username or orphaned-alias remotes in current repo
+    clean_repo_remote_for_routing "$selected_alias"
+
+    # 6. Offer to fix unpushed commits only if any have wrong author/signature
     fix_unpushed_commits_action "$selected_name" "$selected_email"
 
-    # 5. Test SSH
-    if [ -n "$selected_key" ]; then
-        test_github_connection "$selected_alias" || true
-    fi
-
-    # 6. Inline IDE Git Auth Sync (1-press disable if enabled)
-    show_ide_sync_hint "prompt"
-
-    printf "\n"
-    write_color "$C_GREEN" "   [✔] Switched successfully!"
-    write_color "$C_GRAY" "       Global User : ${selected_name}"
-    write_color "$C_GRAY" "       Global Email: ${selected_email}"
-    if is_inside_git_repo; then
-        write_color "$C_GRAY" "       Local Repo  : Synced to ${selected_name} <${selected_email}>"
-    fi
+    STATUS_MSG="✔ Switched to ${selected_alias} (${selected_name} <${selected_email}>)"
+    STATUS_COLOR="$C_GREEN"
+    return 0
 }
 
 remove_profile_action() {
@@ -1481,35 +1593,36 @@ remove_profile_action() {
     count="$(profiles_count)"
     if [ "$count" -eq 0 ]; then
         printf "\n"
-        write_color "$C_YELLOW" "   [!] No profiles to remove."
+        write_color "$C_YELLOW" "   [!] No accounts to remove."
         return
     fi
 
-    printf "\n"
-    draw_header "REMOVE PROFILE"
-    write_color "$C_DARKGRAY" "$(printf "     [%s] %-15s %s" "#" "ALIAS" "EMAIL")"
-    write_color "$C_WHITE" "$(profiles_list_table)"
-    draw_sep
+    local -a items=()
+    local i=0
+    while [ "$i" -lt "$count" ]; do
+        local alias_name email_val
+        alias_name="$(profile_get_field "$i" "alias")"
+        email_val="$(profile_get_field "$i" "userEmail")"
+        items[$i]="$(printf "%-15s %s" "$alias_name" "$email_val")"
+        i=$((i + 1))
+    done
+    items[$count]="← Back"
 
-    local choice
-    read -r -p "   Select ID to remove (0 to cancel): " choice
-    case "$choice" in
-        ""|0|*[!0-9]*) return ;;
-    esac
-
-    local idx=$((choice - 1))
-    if [ "$idx" -lt 0 ] || [ "$idx" -ge "$count" ]; then
+    if ! tui_select_menu "REMOVE ACCOUNT" "${items[@]}" || [ "$TUI_CHOICE" -eq "$count" ]; then
         return
     fi
 
-    local removed_alias removed_name removed_email removed_key
+    local idx="$TUI_CHOICE"
+
+    local removed_alias removed_name removed_email removed_key prev_active_alias
     removed_alias="$(profile_get_field "$idx" "alias")"
     removed_name="$(profile_get_field "$idx" "userName")"
     removed_email="$(profile_get_field "$idx" "userEmail")"
     removed_key="$(profile_get_field "$idx" "keyPath")"
+    prev_active_alias="$(get_active_profile_alias)"
 
     printf "\n"
-    write_color "$C_RED" "   [WARNING] Deleting profile '${removed_alias}'..."
+    write_color "$C_RED" "   Deleting '${removed_alias}' (${removed_email})..."
     local confirm
     read -r -p "   Type 'DELETE' to confirm: " confirm
     if [ "$confirm" != "DELETE" ]; then
@@ -1518,40 +1631,39 @@ remove_profile_action() {
 
     # 1. Remove SSH Keys
     if [ -n "$removed_key" ]; then
-        if [ -f "$removed_key" ]; then
-            rm -f "$removed_key"
-            write_color "$C_GRAY" "   [✔] Private Key deleted."
-        fi
-        if [ -f "${removed_key}.pub" ]; then
-            rm -f "${removed_key}.pub"
-            write_color "$C_GRAY" "   [✔] Public Key deleted."
-        fi
+        rm -f "$removed_key" "${removed_key}.pub" 2>/dev/null || true
     fi
 
     # 2. Remove from SSH Config & Saved HTTPS PAT
-    remove_from_ssh_config "$removed_alias"
-    if profile_has_token "$removed_alias"; then
-        delete_profile_token "$removed_alias"
-        write_color "$C_GRAY" "   [✔] Saved HTTPS PAT deleted."
-    fi
+    remove_from_ssh_config "$removed_alias" "quiet"
+    delete_profile_token "$removed_alias"
 
     # 3. Remove from JSON
     profile_remove_json "$removed_alias"
 
-    # 4. Check & Clear Global/Local Config, Signing Key, and Cached HTTPS Credential
+    # 4. Check & Clear Global/Local Config, Routing, Signing Key, and Cached HTTPS Credential
     local curr_name curr_email curr_skey
     curr_name="$(get_git_current_name)"
     curr_email="$(get_git_current_email)"
-    if [ "$curr_name" = "$removed_name" ] || [ "$curr_email" = "$removed_email" ]; then
+    if [ "$prev_active_alias" = "$removed_alias" ] || \
+       { [ -z "$prev_active_alias" ] && { [ "$curr_name" = "$removed_name" ] || [ "$curr_email" = "$removed_email" ]; }; }; then
         git config --global --unset user.name 2>/dev/null || true
         git config --global --unset user.email 2>/dev/null || true
+        clear_global_github_routing
         clear_github_https_credential
-        write_color "$C_CYAN" "   [INFO] Current Global Git config & cached HTTPS credential cleared because profile was removed."
+    else
+        local active_alias active_key
+        active_alias="$(get_active_profile_alias)"
+        if [ -n "$active_alias" ]; then
+            active_key="$(get_profile_field_by_alias "$active_alias" "keyPath")"
+            sync_global_github_routing "$active_alias" "$active_key"
+        fi
     fi
 
     curr_skey="$(git config --global user.signingkey 2>/dev/null || true)"
     if [ -n "$removed_key" ] && [ "$curr_skey" = "${removed_key}.pub" ]; then
         git config --global --unset user.signingkey 2>/dev/null || true
+        git config --global --unset commit.gpgsign 2>/dev/null || true
     fi
 
     if is_inside_git_repo; then
@@ -1560,51 +1672,58 @@ remove_profile_action() {
         if [ "$local_email" = "$removed_email" ]; then
             git config --local --unset user.name 2>/dev/null || true
             git config --local --unset user.email 2>/dev/null || true
-            write_color "$C_CYAN" "   [INFO] Local repo Git config cleared because profile was removed."
         fi
         local_skey="$(git config --local user.signingkey 2>/dev/null || true)"
         if [ -n "$removed_key" ] && [ "$local_skey" = "${removed_key}.pub" ]; then
             git config --local --unset user.signingkey 2>/dev/null || true
+            git config --local --unset commit.gpgsign 2>/dev/null || true
         fi
     fi
 
-    write_color "$C_GREEN" "   [✔] Profile removed successfully."
+    STATUS_MSG="✔ Removed account '${removed_alias}'."
+    STATUS_COLOR="$C_GREEN"
+    write_color "$C_GREEN" "   [✔] Account '${removed_alias}' removed."
+}
+
+toggle_ssh_rewrite() {
+    if is_ssh_rewrite_enabled; then
+        touch "$NO_SSH_REWRITE_FLAG"
+        clear_global_github_routing
+        write_color "$C_YELLOW" "   [✔] Auto-Route GitHub HTTPS -> SSH disabled (using raw repo remotes / HTTPS PAT)."
+    else
+        rm -f "$NO_SSH_REWRITE_FLAG"
+        local active_alias active_key
+        active_alias="$(get_active_profile_alias)"
+        if [ -n "$active_alias" ]; then
+            active_key="$(get_profile_field_by_alias "$active_alias" "keyPath")"
+            sync_global_github_routing "$active_alias" "$active_key"
+        fi
+        write_color "$C_GREEN" "   [✔] Auto-Route GitHub HTTPS -> SSH enabled (all repos push as active account)."
+    fi
 }
 
 toggle_ssh_signing() {
     if is_commit_signing_enabled; then
         git config --global commit.gpgsign false
         if is_inside_git_repo; then
-            git config --local --unset commit.gpgsign 2>/dev/null || true
+            git config --local --unset-all commit.gpgsign 2>/dev/null || true
         fi
         write_color "$C_YELLOW" "   [✔] SSH Commit Signing disabled (commit.gpgsign = false)."
     else
         git config --global gpg.format ssh
         git config --global commit.gpgsign true
-        # Try to match active email to a saved profile key
-        local curr_email matched_key
-        curr_email="$(get_git_current_email)"
-        matched_key="$(python3 - "$PROFILES_FILE" "$curr_email" <<'PY'
-import json, sys
-try:
-    with open(sys.argv[1], "r", encoding="utf-8-sig") as f:
-        data = json.load(f)
-    if not isinstance(data, list):
-        data = [data] if data else []
-    for p in data:
-        if isinstance(p, dict) and p.get("userEmail") == sys.argv[2] and p.get("keyPath"):
-            print(p["keyPath"])
-            break
-except Exception:
-    pass
-PY
-)"
+        if is_inside_git_repo; then
+            git config --local --unset-all gpg.format 2>/dev/null || true
+            git config --local --unset-all user.signingkey 2>/dev/null || true
+            git config --local --unset-all commit.gpgsign 2>/dev/null || true
+        fi
+        local active_alias matched_key=""
+        active_alias="$(get_active_profile_alias)"
+        if [ -n "$active_alias" ]; then
+            matched_key="$(get_profile_field_by_alias "$active_alias" "keyPath")"
+        fi
         if [ -n "$matched_key" ] && [ -f "${matched_key}.pub" ]; then
             git config --global user.signingkey "${matched_key}.pub"
-            if is_inside_git_repo; then
-                git config --local gpg.format ssh
-                git config --local user.signingkey "${matched_key}.pub"
-            fi
             write_color "$C_GREEN" "   [✔] SSH Commit Signing enabled with key: ${matched_key}.pub"
         else
             write_color "$C_GREEN" "   [✔] SSH Commit Signing enabled (switch a profile to assign signing key)."
@@ -1695,10 +1814,15 @@ manage_https_credentials_action() {
                 write_color "$C_GREEN" "   [✔] Updated GitHub Username to '${new_gh}'."
             fi
 
-            local curr_email
+            local curr_email active_alias active_key
             curr_email="$(get_git_current_email)"
             if [ "$curr_email" = "$sel_email" ]; then
                 sync_https_credentials "$sel_alias" "$new_gh" "$sel_name"
+            fi
+            active_alias="$(get_active_profile_alias)"
+            if [ -n "$active_alias" ]; then
+                active_key="$(get_profile_field_by_alias "$active_alias" "keyPath")"
+                sync_global_github_routing "$active_alias" "$active_key"
             fi
             ;;
         2)
@@ -1807,169 +1931,400 @@ ide_git_auth_sync_action() {
     esac
 }
 
-show_settings_action() {
-    printf "\n"
-    draw_header "SETTINGS & TOOLS"
+# -------------------------- ARROW-KEY TUI HELPERS --------------------------
+tui_hide_cursor() {
+    [ -t 1 ] && printf "\033[?25l"
+}
 
-    local sign_state="OFF"
-    if is_commit_signing_enabled; then
-        sign_state="ON"
+tui_show_cursor() {
+    [ -t 1 ] && printf "\033[?25h"
+}
+
+read_nav_key() {
+    if [ -t 0 ]; then
+        python3 -c '
+import os, select, sys, termios, tty
+
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+try:
+    tty.setraw(fd)
+    ch = os.read(fd, 1)
+    if not ch:
+        print("EOF")
+    elif ch == b"\x03":
+        print("CTRL_C")
+    elif ch in (b"\r", b"\n"):
+        print("ENTER")
+    elif ch == b"\x1b":
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            ch2 = os.read(fd, 1)
+            if ch2 in (b"[", b"O"):
+                r2, _, _ = select.select([fd], [], [], 0.05)
+                if r2:
+                    ch3 = os.read(fd, 1)
+                    if ch3 == b"A":
+                        print("UP")
+                    elif ch3 == b"B":
+                        print("DOWN")
+                    elif ch3 == b"C":
+                        print("RIGHT")
+                    elif ch3 == b"D":
+                        print("LEFT")
+                    else:
+                        print("ESC")
+                else:
+                    print("ESC")
+            else:
+                print("ESC")
+        else:
+            print("ESC")
+    else:
+        try:
+            print(ch.decode("utf-8", errors="ignore"))
+        except Exception:
+            print("")
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+'
+    else
+        local line=""
+        if ! IFS= read -r line; then
+            printf "EOF\n"
+            return
+        fi
+        case "$line" in
+            UP|DOWN|ENTER|ESC|q|Q|0) printf "%s\n" "$line" ;;
+            "") printf "ENTER\n" ;;
+            *) printf "%s\n" "$line" ;;
+        esac
+    fi
+}
+
+# Reusable arrow-key menu selector. Sets TUI_CHOICE to 0-based index, or -1 on cancel/ESC.
+tui_select_menu() {
+    local title="$1"
+    shift
+    local -a items=("$@")
+    local count=${#items[@]}
+    local selected=0
+
+    TUI_CHOICE=-1
+    if [ "$count" -eq 0 ]; then
+        return 1
     fi
 
-    printf "     [1] Open profiles.json (View/Edit DB)\n"
-    printf "     [2] Backup Profiles (Create snapshot)\n"
-    printf "     [3] Open .ssh folder (View Keys)\n"
-    printf "     [4] Toggle SSH Commit Signing (Currently: %s)\n" "$sign_state"
-    printf "     [5] Manage HTTPS Credentials (PAT / Keychain)\n"
-    printf "     [6] IDE Git Auth Sync (github.gitAuthentication)\n"
-    printf "     [0] Back\n"
+    tui_hide_cursor
+    while true; do
+        clear
+        printf "\n"
+        draw_header "$title"
+        printf "\n"
+        local i=0
+        while [ "$i" -lt "$count" ]; do
+            if [ "$i" -eq "$selected" ]; then
+                printf "   %b❯ %s%b\n" "$C_CYAN" "${items[$i]}" "$C_RESET"
+            else
+                printf "     %b%s%b\n" "$C_GRAY" "${items[$i]}" "$C_RESET"
+            fi
+            i=$((i + 1))
+        done
+        printf "\n"
+        write_color "$C_DARKGRAY" "   ↑/↓ Move   Enter Select   Esc Back"
 
-    draw_sep
+        local key
+        key="$(read_nav_key)"
+        case "$key" in
+            UP|k|K)
+                selected=$(( (selected - 1 + count) % count ))
+                ;;
+            DOWN|j|J)
+                selected=$(( (selected + 1) % count ))
+                ;;
+            ENTER)
+                tui_show_cursor
+                TUI_CHOICE=$selected
+                return 0
+                ;;
+            ESC|q|Q|0|CTRL_C|EOF)
+                tui_show_cursor
+                TUI_CHOICE=-1
+                return 1
+                ;;
+        esac
+    done
+}
 
-    local opt
-    read -r -p "   Choose: " opt
-    case "$opt" in
-        1)
-            open_target "$PROFILES_FILE" || write_color "$C_GRAY" "   Path: ${PROFILES_FILE}"
-            ;;
-        2)
-            local bak
-            bak="${BASE_DIR}/backup_$(date '+%Y%m%d_%H%M').json"
-            cp "$PROFILES_FILE" "$bak"
-            write_color "$C_GREEN" "   [✔] Backup created: ${bak}"
-            ;;
-        3)
-            open_target "$SSH_DIR" || write_color "$C_GRAY" "   Path: ${SSH_DIR}"
-            ;;
-        4)
-            toggle_ssh_signing
-            ;;
-        5)
-            manage_https_credentials_action
-            ;;
-        6)
-            ide_git_auth_sync_action
-            ;;
-    esac
+show_settings_action() {
+    local selected=0
+    tui_hide_cursor
+    while true; do
+        local sign_state="OFF" route_state="OFF"
+        if is_commit_signing_enabled; then sign_state="ON"; fi
+        if is_ssh_rewrite_enabled; then route_state="ON"; fi
+
+        local -a s_items=(
+            "Auto-Route GitHub HTTPS -> SSH  [${route_state}]"
+            "SSH Commit Signing              [${sign_state}]"
+            "Manage HTTPS Credentials (PAT)"
+            "IDE Git Auth Sync (github.gitAuthentication)"
+            "Backup Profiles"
+            "Open profiles.json"
+            "Open .ssh folder"
+            "← Back"
+        )
+        local s_count=${#s_items[@]}
+
+        clear
+        printf "\n"
+        draw_header "SETTINGS"
+        printf "\n"
+        local i=0
+        while [ "$i" -lt "$s_count" ]; do
+            if [ "$i" -eq "$selected" ]; then
+                printf "   %b❯ %s%b\n" "$C_CYAN" "${s_items[$i]}" "$C_RESET"
+            else
+                printf "     %b%s%b\n" "$C_GRAY" "${s_items[$i]}" "$C_RESET"
+            fi
+            i=$((i + 1))
+        done
+        printf "\n"
+        write_color "$C_DARKGRAY" "   ↑/↓ Move   Enter Select   Esc Back"
+
+        local key
+        key="$(read_nav_key)"
+        case "$key" in
+            UP|k|K)
+                selected=$(( (selected - 1 + s_count) % s_count ))
+                ;;
+            DOWN|j|J)
+                selected=$(( (selected + 1) % s_count ))
+                ;;
+            ESC|q|Q|0|CTRL_C|EOF)
+                tui_show_cursor
+                return
+                ;;
+            ENTER)
+                tui_show_cursor
+                case "$selected" in
+                    0) toggle_ssh_rewrite ;;
+                    1) toggle_ssh_signing ;;
+                    2) manage_https_credentials_action; pause_prompt ;;
+                    3) ide_git_auth_sync_action; pause_prompt ;;
+                    4)
+                        local bak
+                        bak="${BASE_DIR}/backup_$(date '+%Y%m%d_%H%M').json"
+                        cp "$PROFILES_FILE" "$bak"
+                        printf "\n"
+                        write_color "$C_GREEN" "   [✔] Backup created: ${bak}"
+                        pause_prompt
+                        ;;
+                    5) open_target "$PROFILES_FILE" || { write_color "$C_GRAY" "   Path: ${PROFILES_FILE}"; pause_prompt; } ;;
+                    6) open_target "$SSH_DIR" || { write_color "$C_GRAY" "   Path: ${SSH_DIR}"; pause_prompt; } ;;
+                    7) return ;;
+                esac
+                tui_hide_cursor
+                ;;
+        esac
+    done
 }
 
 # -------------------------- MAIN UI --------------------------
-show_banner() {
-    printf "%b" "$C_MAGENTA"
-    cat <<'EOF'
-      ██████  ██ ████████     ███████ ██     ██ ██ ████████  ██████  ██   ██
-     ██       ██    ██        ██      ██     ██ ██    ██    ██       ██   ██
-     ██   ███ ██    ██        ███████ ██  █  ██ ██    ██    ██       ███████
-     ██    ██ ██    ██             ██ ██ ███ ██ ██    ██    ██       ██   ██
-      ██████  ██    ██        ███████  ███ ███  ██    ██     ██████  ██   ██
-EOF
-    printf "%b" "$C_RESET"
-    draw_sep
-
-    local curr_name curr_email os_label
+show_home() {
+    local selected_idx="${1:-0}"
+    local curr_name curr_email active_alias
     curr_name="$(get_git_current_name)"
     curr_email="$(get_git_current_email)"
-    if [ "$OS_TYPE" = "Darwin" ]; then
-        os_label="macOS"
-    else
-        os_label="$OS_TYPE"
-    fi
+    active_alias="$(get_active_profile_alias)"
 
-    write_color "$C_WHITE" "   » GIT PROFILE MANAGEMENT SYSTEM [v2.3 - ${os_label}]"
-    draw_sep
+    # Auto-heal global routing if active profile is set (e.g. upgraded from v2.3.0)
+    ensure_active_routing_synced "$active_alias"
 
-    if [ "$(id -u)" -eq 0 ]; then
-        write_color "$C_GREEN" "   [✔] STATUS: Running as root"
-    else
-        write_color "$C_GREEN" "   [✔] STATUS: Running as $(whoami) (${os_label})"
-    fi
-
-    write_color "$C_CYAN" "   [●] CURRENT: " "true"
-    write_color "$C_WHITE" "${curr_name} " "true"
-    write_color "$C_DARKGRAY" "<${curr_email}>"
-
+    local has_local_override=false local_name="" local_email=""
     if is_inside_git_repo; then
-        local local_name local_email
         local_name="$(get_git_local_name)"
         local_email="$(get_git_local_email)"
-        if [ -n "$local_email" ] && [ "$local_email" != "$curr_email" ]; then
-            write_color "$C_YELLOW" "   [!] LOCAL OVERRIDE: ${local_name:-$curr_name} <${local_email}> (Switch to sync)"
+        if { [ -n "$local_email" ] && [ "$local_email" != "$curr_email" ]; } || \
+           { [ -n "$local_name" ] && [ "$local_name" != "$curr_name" ]; }; then
+            has_local_override=true
         fi
+    fi
 
+    printf "\n"
+    draw_border_top 62 "$C_CYAN"
+    draw_line "git-switch v2.5" 62 "$C_CYAN" "$C_WHITE"
+    if [ "$has_local_override" = "true" ]; then
+        draw_line "! Pushing as: ${local_name:-$curr_name} <${local_email:-$curr_email}> (local)" 62 "$C_CYAN" "$C_YELLOW"
+    elif [ "$curr_name" = "Not Set" ] && [ "$curr_email" = "Not Set" ]; then
+        draw_line "Pushing as: (not set)" 62 "$C_CYAN" "$C_YELLOW"
+    elif [ -n "$active_alias" ]; then
+        draw_line "● Pushing as: ${active_alias} (${curr_name} <${curr_email}>)" 62 "$C_CYAN" "$C_GREEN"
+    else
+        draw_line "● Pushing as: ${curr_name} <${curr_email}>" 62 "$C_CYAN" "$C_GREEN"
+    fi
+    draw_border_bottom 62 "$C_CYAN"
+
+    if [ "$has_local_override" = "true" ]; then
+        write_color "$C_YELLOW" "  [!] Local repo config overrides global — select account to sync"
+    fi
+
+    # Only surface a 1-line warning if the current repo has a real transport mismatch
+    if is_inside_git_repo; then
         local origin_url
-        origin_url="$(git remote get-url origin 2>/dev/null || true)"
+        origin_url="$(git remote get-url --push origin 2>/dev/null || git remote get-url origin 2>/dev/null || true)"
         if [ -n "$origin_url" ]; then
-            local rinfo rtype rpath ralias active_alias
+            local rinfo rtype rpath ralias
             rinfo="$(classify_github_remote "$origin_url")"
             IFS='|' read -r rtype rpath ralias <<< "$rinfo"
-            case "$rtype" in
-                https)
-                    write_color "$C_YELLOW" "   [!] REMOTE (HTTPS): ${origin_url} (SSH config ignored; switch to convert/PAT)"
-                    ;;
-                ssh_default)
-                    write_color "$C_YELLOW" "   [!] REMOTE (SSH): ${origin_url} (No profile alias; switch to bind)"
-                    ;;
-                ssh_alias)
-                    active_alias="$(get_active_profile_alias)"
-                    if [ -n "$active_alias" ] && [ "$ralias" != "$active_alias" ]; then
-                        write_color "$C_YELLOW" "   [!] REMOTE (SSH): github.com-${ralias} != active '${active_alias}' (Switch to sync)"
-                    else
-                        write_color "$C_GREEN" "   [✔] REMOTE (SSH): ${origin_url}"
-                    fi
-                    ;;
-            esac
+            if [ -n "$active_alias" ]; then
+                case "$rtype" in
+                    ssh_alias)
+                        if [ "$ralias" != "$active_alias" ]; then
+                            write_color "$C_YELLOW" "  [!] Repo remote uses '${ralias}' instead of '${active_alias}' — select account to sync"
+                        fi
+                        ;;
+                    https|ssh_default)
+                        if is_ssh_rewrite_enabled; then
+                            write_color "$C_YELLOW" "  [!] Repo remote not yet routed to '${active_alias}' — select account to sync"
+                        fi
+                        ;;
+                esac
+            fi
         fi
     fi
 
-    if is_commit_signing_enabled; then
-        local skey
-        skey="$(git config --get user.signingkey 2>/dev/null || true)"
-        if [ -n "$skey" ]; then
-            write_color "$C_GREEN" "   [✔] SSH SIGNING: ON ($(basename "$skey"))"
+    if [ -n "$STATUS_MSG" ]; then
+        write_color "${STATUS_COLOR:-$C_GREEN}" "  ${STATUS_MSG}"
+    fi
+
+    printf "\n"
+
+    local count
+    count="$(profiles_count)"
+
+    write_color "$C_DARKGRAY" "  ACCOUNTS"
+    if [ "$count" -eq 0 ]; then
+        write_color "$C_GRAY" "    (no accounts yet — select '+ Add account' below)"
+    else
+        local i=0
+        while [ "$i" -lt "$count" ]; do
+            local p_alias p_email is_active=false badge=""
+            p_alias="$(profile_get_field "$i" "alias")"
+            p_email="$(profile_get_field "$i" "userEmail")"
+            if [ -n "$active_alias" ] && [ "$p_alias" = "$active_alias" ] && [ "$has_local_override" = "false" ]; then
+                is_active=true
+                badge=" (active)"
+            fi
+            if [ "$i" -eq "$selected_idx" ]; then
+                if [ "$is_active" = "true" ]; then
+                    printf "  %b❯ ● %-15s%b %b%s%b%b%s%b\n" "$C_CYAN" "$p_alias" "$C_RESET" "$C_WHITE" "$p_email" "$C_RESET" "$C_GREEN" "$badge" "$C_RESET"
+                else
+                    printf "  %b❯   %-15s%b %b%s%b\n" "$C_CYAN" "$p_alias" "$C_RESET" "$C_WHITE" "$p_email" "$C_RESET"
+                fi
+            else
+                if [ "$is_active" = "true" ]; then
+                    printf "    %b● %-15s%b %b%s%b%b%s%b\n" "$C_GREEN" "$p_alias" "$C_RESET" "$C_DARKGRAY" "$p_email" "$C_RESET" "$C_GREEN" "$badge" "$C_RESET"
+                else
+                    printf "      %-15s %b%s%b\n" "$p_alias" "$C_DARKGRAY" "$p_email" "$C_RESET"
+                fi
+            fi
+            i=$((i + 1))
+        done
+    fi
+
+    printf "\n"
+    write_color "$C_DARKGRAY" "  ACTIONS"
+    local -a actions=("+ Add account" "- Remove account" "✓ Test connection" "⚙ Settings" "× Exit")
+    local a_i=0
+    while [ "$a_i" -lt 5 ]; do
+        local row_idx=$((count + a_i))
+        if [ "$row_idx" -eq "$selected_idx" ]; then
+            printf "  %b❯ %s%b\n" "$C_CYAN" "${actions[$a_i]}" "$C_RESET"
         else
-            write_color "$C_YELLOW" "   [!] SSH SIGNING: ON (no signing key set)"
+            printf "    %b%s%b\n" "$C_GRAY" "${actions[$a_i]}" "$C_RESET"
         fi
-    fi
-    draw_sep
-}
+        a_i=$((a_i + 1))
+    done
 
-show_menu() {
     printf "\n"
-    write_color "$C_GRAY" "   SELECT AN OPTION:"
-    printf "\n"
-    printf "     [1] Add New Profile\n"
-    printf "     [2] Switch Profile\n"
-    printf "     [3] Remove Profile\n"
-    printf "     [4] Settings\n"
-    printf "     [5] Test Connection\n"
-    printf "     [0] Exit Program\n"
-    printf "\n"
-    draw_sep
+    write_color "$C_DARKGRAY" "  ↑/↓ Move   Enter Select   q Quit"
 }
 
 # ================= MAIN EXECUTION LOOP =================
 main() {
     check_dependencies
     initialize_system
+    trap 'tui_show_cursor' EXIT INT TERM
+
+    local selected=0
+    # Start cursor on the currently active account if any
+    local init_active init_count i=0
+    init_active="$(get_active_profile_alias)"
+    init_count="$(profiles_count)"
+    if [ -n "$init_active" ] && [ "$init_count" -gt 0 ]; then
+        while [ "$i" -lt "$init_count" ]; do
+            if [ "$(profile_get_field "$i" "alias")" = "$init_active" ]; then
+                selected=$i
+                break
+            fi
+            i=$((i + 1))
+        done
+    fi
 
     local running=true
+    tui_hide_cursor
     while [ "$running" = "true" ]; do
-        clear
-        show_banner
-        show_menu
-        local selection=""
-        read -r -p "  Choose an option (0-5): " selection || break
+        local count total
+        count="$(profiles_count)"
+        total=$((count + 5))
+        if [ "$selected" -ge "$total" ]; then
+            selected=$((total - 1))
+        fi
 
-        case "$selection" in
-            1) add_profile_action; pause_prompt ;;
-            2) switch_profile_action; pause_prompt ;;
-            3) remove_profile_action; pause_prompt ;;
-            4) show_settings_action; pause_prompt ;;
-            5) test_connection_action; pause_prompt ;;
-            0) running=false; printf "\n"; write_color "$C_MAGENTA" "  Goodbye! 👋" ;;
-            *) write_color "$C_RED" "  Invalid option."; sleep 0.5 ;;
+        clear
+        show_home "$selected"
+
+        local key
+        key="$(read_nav_key)"
+        STATUS_MSG=""
+        STATUS_COLOR=""
+
+        case "$key" in
+            UP|k|K)
+                selected=$(( (selected - 1 + total) % total ))
+                ;;
+            DOWN|j|J)
+                selected=$(( (selected + 1) % total ))
+                ;;
+            ESC|q|Q|0|CTRL_C|EOF)
+                running=false
+                ;;
+            ENTER)
+                tui_show_cursor
+                if [ "$selected" -lt "$count" ]; then
+                    NEED_PAUSE=false
+                    apply_profile_index "$selected"
+                    if [ "$NEED_PAUSE" = "true" ]; then
+                        pause_prompt
+                    fi
+                else
+                    local act=$((selected - count))
+                    case "$act" in
+                        0) add_profile_action; pause_prompt ;;
+                        1) remove_profile_action; pause_prompt ;;
+                        2) test_connection_action; pause_prompt ;;
+                        3) show_settings_action ;;
+                        4) running=false ;;
+                    esac
+                fi
+                if [ "$running" = "true" ]; then
+                    tui_hide_cursor
+                fi
+                ;;
         esac
     done
+    tui_show_cursor
 }
 
 # Only run main when executed directly (allows sourcing for tests)

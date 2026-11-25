@@ -1,6 +1,6 @@
 {
   "name": "@nhatprx/gitswitch",
-  "version": "2.3.0",
+  "version": "3.0.0",
   "description": "Cross-platform CLI utility to manage multiple Git identities, SSH keys, HTTPS credentials, and IDE Git auth.",
   "bin": {
     "gitswitch": "bin/gitswitch.js",
@@ -8,13 +8,12 @@
   },
   "files": [
     "bin/",
-    "git.sh",
-    "git.ps1",
+    "src/",
     "README.md"
   ],
   "scripts": {
     "start": "node bin/gitswitch.js",
-    "check": "bash -n git.sh && bash -n install.sh && node --check bin/gitswitch.js"
+    "check": "node --check bin/gitswitch.js && node --check src/core.js && node --check src/tui.js && node --check src/app.js"
   },
   "keywords": [
     "git",

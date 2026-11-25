@@ -1,8 +1,8 @@
 # ==============================================================================
-# GIT PROFILE MANAGER - ULTIMATE EDITION (NATIVE POWERSHELL)
-# Version: 2.2 (Cross-Platform PowerShell)
+# GIT PROFILE MANAGER (NATIVE POWERSHELL)
+# Version: 2.4 (Cross-Platform PowerShell)
 # Author: nhatprx
-# Features: SSH Auto-Gen, HTTPS PAT Swap, Remote Sync, IDE Auth Sync
+# Features: 1-Click Switch, Global Multi-Repo Routing, SSH Signing, HTTPS PAT
 # ==============================================================================
 
 # -------------------------- CONFIGURATION --------------------------
@@ -11,8 +11,14 @@ $HomeDir = if ($IsWinOS -and $env:USERPROFILE) { $env:USERPROFILE } else { $HOME
 $BaseDir = Join-Path $HomeDir ".git-switch"
 $ProfilesFile = Join-Path $BaseDir "profiles.json"
 $TokensDir = Join-Path $BaseDir "tokens"
+$ActiveGitConfig = Join-Path $BaseDir "active.gitconfig"
+$ActiveGitConfigInclude = "~/.git-switch/active.gitconfig"
+$NoSshRewriteFlag = Join-Path $BaseDir "no-ssh-rewrite"
 $SSHDir = Join-Path $HomeDir ".ssh"
 $SSHConfigFile = Join-Path $SSHDir "config"
+$script:StatusMsg = ""
+$script:StatusColor = "Green"
+$script:NeedPause = $false
 
 function Wait-KeyPress {
     Read-Host "Press Enter to continue..." | Out-Null
@@ -147,40 +153,207 @@ function Test-CommitSigningEnabled {
 }
 
 function Sync-Git-Identity {
-    param([string]$UserName, [string]$UserEmail, [string]$KeyPath)
+    param([string]$UserName, [string]$UserEmail, [string]$KeyPath, [switch]$Quiet)
 
     # 1. Global identity
     git config --global user.name "$UserName"
     git config --global user.email "$UserEmail"
 
-    # 2. Local repo identity (prevents stale .git/config from overriding global)
+    # 2. Clear stale local repo overrides so this repo inherits global switches cleanly
     $inRepo = Test-InsideGitRepo
     if ($inRepo) {
-        git config --local user.name "$UserName"
-        git config --local user.email "$UserEmail"
-        Write-Color "   [✔] Synced local repo user.name & user.email (.git/config)." -Color Green
+        git config --local --unset-all user.name 2>$null
+        git config --local --unset-all user.email 2>$null
+        git config --local --unset-all user.signingkey 2>$null
+        git config --local --unset-all gpg.format 2>$null
+        $lSignCur = git config --local commit.gpgsign 2>$null
+        if ($lSignCur -ne "false") {
+            git config --local --unset-all commit.gpgsign 2>$null
+        }
 
         $localSshCmd = git config --local core.sshCommand 2>$null
         if (-not [string]::IsNullOrWhiteSpace($localSshCmd)) {
-            Write-Color "   [!] Local core.sshCommand is set ($localSshCmd) and may override ~/.ssh/config." -Color Yellow
+            Write-Color "   [!] Local core.sshCommand is set ($localSshCmd) and may override SSH key." -Color Yellow
+            $script:NeedPause = $true
         }
     }
 
-    # 3. Auto-enable & sync SSH commit signing unless user explicitly disabled it (commit.gpgsign = false)
+    $globalSshCmd = git config --global core.sshCommand 2>$null
+    if (-not [string]::IsNullOrWhiteSpace($globalSshCmd)) {
+        Write-Color "   [!] Global core.sshCommand is set ($globalSshCmd) and may override SSH key." -Color Yellow
+        $script:NeedPause = $true
+    }
+
+    # 3. Auto-enable & sync global SSH commit signing unless user explicitly disabled it
     if ($KeyPath -and (Test-Path "$KeyPath.pub")) {
         $pubKey = "$KeyPath.pub"
         $gSign = git config --global commit.gpgsign 2>$null
-        $lSign = if ($inRepo) { git config --local commit.gpgsign 2>$null } else { $null }
-        if ($gSign -ne "false" -and $lSign -ne "false") {
+        if ($gSign -ne "false") {
             git config --global gpg.format ssh
             git config --global user.signingkey "$pubKey"
             git config --global commit.gpgsign true
-            if ($inRepo) {
-                git config --local gpg.format ssh
-                git config --local user.signingkey "$pubKey"
-                git config --local commit.gpgsign true
+            if (-not $Quiet) {
+                Write-Color "   [✔] SSH Commit Signing active: $pubKey" -Color Green
             }
-            Write-Color "   [✔] SSH Commit Signing active: $pubKey" -Color Green
+        }
+    }
+}
+
+function Test-SshRewriteEnabled {
+    return (-not (Test-Path $NoSshRewriteFlag))
+}
+
+function Ensure-ActiveGitConfigIncluded {
+    $existing = @(git config --global --get-all include.path 2>$null)
+    if ($existing -notcontains $ActiveGitConfigInclude) {
+        git config --global --add include.path $ActiveGitConfigInclude
+    }
+}
+
+function Clear-GlobalGitHubRouting {
+    if (-not (Test-Path $BaseDir)) { New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($ActiveGitConfig, "# Managed by git-switch (inactive)`n", [System.Text.UTF8Encoding]::new($false))
+}
+
+function Sync-GlobalGitHubRouting {
+    param([string]$Alias, [string]$KeyPath)
+
+    if (-not (Test-Path $BaseDir)) { New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null }
+    if (-not (Test-SshRewriteEnabled)) {
+        Clear-GlobalGitHubRouting
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($Alias) -or [string]::IsNullOrWhiteSpace($KeyPath) -or -not (Test-Path $KeyPath)) {
+        Clear-GlobalGitHubRouting
+        return
+    }
+
+    Ensure-ActiveGitConfigIncluded
+
+    $profiles = @(Load-Profiles)
+    $insteadOf = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in @("https://github.com/", "https://www.github.com/", "http://github.com/", "git@github.com:", "ssh://git@github.com/", "ssh://git@github.com:22/")) {
+        $insteadOf.Add($p)
+    }
+
+    foreach ($prof in $profiles) {
+        if ($null -eq $prof) { continue }
+        $other = if ($prof.alias) { $prof.alias.Trim() } else { "" }
+        if ($other -and $other -ne $Alias) {
+            foreach ($pref in @("git@github.com-$other`:", "ssh://git@github.com-$other/", "ssh://git@github.com-$other`:22/")) {
+                if (-not $insteadOf.Contains($pref)) { $insteadOf.Add($pref) }
+            }
+        }
+        $ghUser = if ($prof.githubUsername) { $prof.githubUsername.Trim() } else { "" }
+        if ($ghUser -and ($ghUser -match "^[A-Za-z0-9-]+$")) {
+            $pref = "https://$ghUser@github.com/"
+            if (-not $insteadOf.Contains($pref)) { $insteadOf.Add($pref) }
+        }
+    }
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("# Managed by git-switch (Active: $Alias)")
+    $lines.Add("[url `"git@github.com-$Alias`:`"]")
+    foreach ($pref in $insteadOf) {
+        $lines.Add("    insteadOf = $pref")
+    }
+    [System.IO.File]::WriteAllText($ActiveGitConfig, (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+}
+
+function Get-ActiveProfile {
+    param([array]$Profiles = $null)
+    if ($null -eq $Profiles) { $Profiles = @(Load-Profiles) }
+    $Curr = Get-Git-Current
+    $emailMatches = @($Profiles | Where-Object { $null -ne $_ -and $_.userEmail -eq $Curr.Email })
+    if ($emailMatches.Count -eq 0) { return $null }
+
+    # 1. Exact match on signing key
+    $currSKey = git config --global user.signingkey 2>$null
+    if (-not [string]::IsNullOrWhiteSpace($currSKey)) {
+        foreach ($p in $emailMatches) {
+            if ($p.keyPath -and ($currSKey -eq "$($p.keyPath).pub" -or $currSKey -eq $p.keyPath)) {
+                return $p
+            }
+        }
+    }
+
+    # 2. Match active alias recorded in active.gitconfig
+    if (Test-Path $ActiveGitConfig) {
+        $firstLine = (Get-Content $ActiveGitConfig -TotalCount 1 -Encoding UTF8 -ErrorAction SilentlyContinue)
+        if ($firstLine -and $firstLine.Trim() -match "^# Managed by git-switch \(Active:\s*([^)]+)\)$") {
+            $cfgAlias = $Matches[1].Trim()
+            foreach ($p in $emailMatches) {
+                if ($p.alias -eq $cfgAlias) { return $p }
+            }
+        }
+    }
+
+    # 3. Match email + name
+    foreach ($p in $emailMatches) {
+        if ($p.userName -eq $Curr.Name) { return $p }
+    }
+
+    # 4. Fallback: first profile with matching email
+    return $emailMatches[0]
+}
+
+function Ensure-ActiveRoutingSynced {
+    param($ActiveProfile)
+    if ($null -eq $ActiveProfile -or -not (Test-SshRewriteEnabled)) { return }
+    if ([string]::IsNullOrWhiteSpace($ActiveProfile.alias) -or [string]::IsNullOrWhiteSpace($ActiveProfile.keyPath) -or -not (Test-Path $ActiveProfile.keyPath)) { return }
+
+    $needsSync = $false
+    $existingInc = @(git config --global --get-all include.path 2>$null)
+    if ($existingInc -notcontains $ActiveGitConfigInclude) {
+        $needsSync = $true
+    } elseif (-not (Test-Path $ActiveGitConfig)) {
+        $needsSync = $true
+    } else {
+        $firstLine = (Get-Content $ActiveGitConfig -TotalCount 1 -Encoding UTF8 -ErrorAction SilentlyContinue)
+        if (-not $firstLine -or $firstLine.Trim() -ne "# Managed by git-switch (Active: $($ActiveProfile.alias))") {
+            $needsSync = $true
+        }
+    }
+
+    if ($needsSync) {
+        Ensure-SshReady -Alias $ActiveProfile.alias -KeyPath $ActiveProfile.keyPath
+        Sync-GlobalGitHubRouting -Alias $ActiveProfile.alias -KeyPath $ActiveProfile.keyPath
+    }
+}
+
+function Ensure-SshReady {
+    param([string]$Alias, [string]$KeyPath)
+    if ([string]::IsNullOrWhiteSpace($Alias) -or [string]::IsNullOrWhiteSpace($KeyPath) -or -not (Test-Path $KeyPath)) { return }
+    $hasHost = $false
+    if (Test-Path $SSHConfigFile) {
+        $content = Get-Content $SSHConfigFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($content -match "(?m)^\s*Host\s+github\.com-$([regex]::Escape($Alias))(\s|$)") {
+            $hasHost = $true
+        }
+    }
+    if (-not $hasHost) {
+        Update-SSH-Config -Alias $Alias -KeyPath $KeyPath -Quiet
+    }
+}
+
+function Clear-EmbeddedHttpsRemote {
+    param([string]$Alias)
+    if (-not (Test-InsideGitRepo) -or -not (Test-SshRewriteEnabled)) { return }
+    $rawUrl = git config --local --get remote.origin.url 2>$null
+    if ([string]::IsNullOrWhiteSpace($rawUrl)) { return }
+    $u = $rawUrl.Trim()
+    if ($u -match "^https?://[^/@]+@github\.com(?::\d+)?/(.+)$") {
+        $repoPath = $Matches[1].TrimEnd('/')
+        git remote set-url origin "https://github.com/$repoPath"
+        return
+    }
+    if ($u -match "^(?:ssh://)?git@github\.com-([^:/]+)(?::\d+)?[:/](.+)$") {
+        if ($Matches[1] -ne $Alias) {
+            $effUrl = git remote get-url origin 2>$null
+            $rinfo = Get-GitHubRemoteInfo -Url $effUrl
+            if ($rinfo.SshAlias -ne $Alias -and $rinfo.RepoPath) {
+                git remote set-url origin "https://github.com/$($rinfo.RepoPath)"
+            }
         }
     }
 }
@@ -224,6 +397,7 @@ function Invoke-FixUnpushedCommits {
 
     if ($mismatchCount -eq 0) { return }
 
+    $script:NeedPause = $true
     Write-Color "`n   [!] Found $mismatchCount unpushed commit(s) with different author or missing SSH signature." -Color Yellow
     $doFix = Read-Host "   Update author to '$TargetName <$TargetEmail>' & re-sign before push? [Y/n]"
     if ($doFix -match '^(n|no)$') {
@@ -308,9 +482,11 @@ function Generate-SSH-Key {
 }
 
 function Update-SSH-Config {
-    param($Alias, $KeyPath)
-    
-    # Định dạng block config giống logic Python
+    param($Alias, $KeyPath, [switch]$Quiet)
+
+    # Remove existing entry with the same alias first to avoid duplicates
+    Remove-From-SSH-Config -Alias $Alias -Quiet
+
     # Host ảo sẽ là: github.com-<alias>
     $ConfigBlock = @"
 
@@ -318,55 +494,54 @@ function Update-SSH-Config {
 Host github.com-$Alias
     HostName github.com
     User git
-    IdentityFile $KeyPath
+    IdentityFile "$KeyPath"
     IdentitiesOnly yes
 "@
     
     try {
         Add-Content -Path $SSHConfigFile -Value $ConfigBlock -Encoding UTF8
-        Write-Color "  [✔] SSH Config updated (Host: github.com-$Alias)." -Color Green
+        if (-not $Quiet) { Write-Color "  [✔] SSH Config updated (Host: github.com-$Alias)." -Color Green }
     } catch {
-        Write-Color "  [X] Failed to update .ssh/config." -Color Red
+        if (-not $Quiet) { Write-Color "  [X] Failed to update .ssh/config." -Color Red }
     }
 }
 
 function Remove-From-SSH-Config {
-    param($Alias)
+    param($Alias, [switch]$Quiet)
     
     if (-not (Test-Path $SSHConfigFile)) { return }
     
     try {
-        # Đọc toàn bộ dòng
-        $Lines = Get-Content $SSHConfigFile -Encoding UTF8
+        $Lines = @(Get-Content $SSHConfigFile -Encoding UTF8)
         $NewLines = @()
         $Skip = $false
+        $TargetHeader = "# Git profile: $Alias"
+        $TargetHost = "Host github.com-$Alias"
         
         foreach ($Line in $Lines) {
-            # Tìm dòng bắt đầu comment profile
-            if ($Line -match "# Git profile: $Alias") {
+            $Trimmed = $Line.Trim()
+            if ($Trimmed -eq $TargetHeader) {
                 $Skip = $true
                 continue
             }
-            
-            # Nếu đang skip mà gặp dòng trống (hết block) hoặc block mới -> dừng skip
-            if ($Skip -and ($Line.Trim() -eq "" -or $Line -match "^Host ")) {
-                 # Nếu gặp Host khác ngay lập tức thì giữ lại, nếu dòng trống thì bỏ qua 1 dòng trống
-                 if ($Line -match "^Host ") { $Skip = $false }
-            }
-            
-            # Logic đơn giản hóa: Block kết thúc bằng dòng trống hoặc Host tiếp theo
-            # Logic Python: Remove lines until next empty line or next header
             if ($Skip) {
-                if ([string]::IsNullOrWhiteSpace($Line)) { $Skip = $false }
-            } else {
-                $NewLines += $Line
+                if ($Trimmed -eq "") {
+                    $Skip = $false
+                    continue
+                }
+                if (($Trimmed.StartsWith("Host ") -and $Trimmed -ne $TargetHost) -or $Trimmed.StartsWith("# Git profile:")) {
+                    $Skip = $false
+                    $NewLines += $Line
+                }
+                continue
             }
+            $NewLines += $Line
         }
         
         $NewLines | Set-Content $SSHConfigFile -Encoding UTF8
-        Write-Color "  [✔] Removed entry from SSH Config." -Color Green
+        if (-not $Quiet) { Write-Color "  [✔] Removed entry from SSH Config." -Color Green }
     } catch {
-        Write-Color "  [!] Error cleaning SSH Config." -Color Yellow
+        if (-not $Quiet) { Write-Color "  [!] Error cleaning SSH Config." -Color Yellow }
     }
 }
 
@@ -445,31 +620,35 @@ function Set-GitHubHttpsCredential {
 }
 
 function Sync-HttpsCredentials {
-    param([string]$Alias, [string]$GitHubUser, [string]$FallbackUser)
+    param([string]$Alias, [string]$GitHubUser, [string]$FallbackUser, [switch]$Quiet)
     $effectiveUser = if (-not [string]::IsNullOrWhiteSpace($GitHubUser)) { $GitHubUser } else { $FallbackUser }
 
     if (Test-ProfileHasToken -Alias $Alias) {
         $pat = Get-ProfileToken -Alias $Alias
         if ($pat -and $effectiveUser) {
             $res = Set-GitHubHttpsCredential -GitHubUser $effectiveUser -Token $pat
-            if ($res -eq "ok") {
-                Write-Color "   [✔] Swapped HTTPS credential for github.com (user: $effectiveUser)." -Color Green
-            } elseif ($res -eq "no_helper") {
-                $hintHelper = if ($IsWinOS) { "manager" } elseif ($IsMacOS) { "osxkeychain" } else { "store" }
-                Write-Color "   [!] No Git credential.helper configured. Run: git config --global credential.helper $hintHelper" -Color Yellow
-            } else {
-                Write-Color "   [!] Could not write HTTPS credential to Git credential helper." -Color Yellow
+            if (-not $Quiet) {
+                if ($res -eq "ok") {
+                    Write-Color "   [✔] Swapped HTTPS credential for github.com (user: $effectiveUser)." -Color Green
+                } elseif ($res -eq "no_helper") {
+                    $hintHelper = if ($IsWinOS) { "manager" } elseif ($IsMacOS) { "osxkeychain" } else { "store" }
+                    Write-Color "   [!] No Git credential.helper configured. Run: git config --global credential.helper $hintHelper" -Color Yellow
+                } else {
+                    Write-Color "   [!] Could not write HTTPS credential to Git credential helper." -Color Yellow
+                }
             }
         }
     } else {
         Clear-GitHubHttpsCredential
-        Write-Color "   [INFO] Cleared cached HTTPS credential for github.com (no PAT saved for '$Alias')." -Color Gray
+        if (-not $Quiet) {
+            Write-Color "   [INFO] Cleared cached HTTPS credential for github.com (no PAT saved for '$Alias')." -Color Gray
+        }
     }
 
     if (-not [string]::IsNullOrWhiteSpace($GitHubUser) -and (Get-Command gh -ErrorAction SilentlyContinue)) {
         try {
             & gh auth switch --user $GitHubUser 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            if ($LASTEXITCODE -eq 0 -and -not $Quiet) {
                 Write-Color "   [✔] Switched GitHub CLI (gh) account to: $GitHubUser" -Color Green
             }
         } catch {}
@@ -522,50 +701,6 @@ function Get-GitHubRemoteInfo {
         return @{ Type = "ssh_alias"; RepoPath = $Matches[2].TrimEnd('/'); SshAlias = $Matches[1] }
     }
     return @{ Type = "other"; RepoPath = ""; SshAlias = "" }
-}
-
-function Update-Repo-Url {
-    param([string]$Alias, [string]$Mode = "prompt")
-    if (-not (Test-InsideGitRepo)) { return }
-
-    $CurrentUrl = git remote get-url origin 2>$null
-    if (-not $CurrentUrl) { return }
-
-    Write-Color "`n   [INFO] Checking Repository Remote URL..." -Color Cyan
-
-    $info = Get-GitHubRemoteInfo -Url $CurrentUrl
-    $targetSshUrl = "git@github.com-$Alias`:$($info.RepoPath)"
-
-    switch ($info.Type) {
-        "https" {
-            Write-Color "   [!] Detected HTTPS remote: $CurrentUrl" -Color Yellow
-            Write-Color "       SSH keys (~/.ssh/config) are ignored for HTTPS remotes." -Color Gray
-            $doConvert = "y"
-            if ($Mode -ne "auto") {
-                $doConvert = Read-Host "   Convert remote to SSH alias ($targetSshUrl)? [Y/n]"
-            }
-            if ($doConvert -match "^(n|no)$") {
-                Write-Color "   [INFO] Keeping HTTPS remote." -Color Gray
-                if (-not (Test-ProfileHasToken -Alias $Alias)) {
-                    Write-Color "   [!] No HTTPS PAT saved for '$Alias'. Add one in Settings -> [5] Manage HTTPS Credentials." -Color Yellow
-                }
-            } else {
-                git remote set-url origin $targetSshUrl
-                Write-Color "   [✔] Converted HTTPS remote -> SSH alias: $targetSshUrl" -Color Green
-            }
-        }
-        { $_ -in @("ssh_default", "ssh_alias") } {
-            if ($targetSshUrl -ne $CurrentUrl) {
-                git remote set-url origin $targetSshUrl
-                Write-Color "   [✔] Updated SSH Remote URL to: $targetSshUrl" -Color Green
-            } else {
-                Write-Color "   [INFO] Remote URL already uses SSH alias: $CurrentUrl" -Color Gray
-            }
-        }
-        default {
-            Write-Color "   [INFO] Remote URL is not hosted on GitHub ($CurrentUrl)." -Color Gray
-        }
-    }
 }
 
 # --- IDE GIT AUTH SYNC ---
@@ -780,74 +915,18 @@ function Set-IdeGitAuthSetting {
     }
 }
 
-function Show-IdeSyncHint {
-    param([string]$Mode = "hint")
-
-    $ides = @(Get-IdeSettingsPaths)
-    $needHint = $false
-    $pendingIdes = @()
-    $ideNames = @()
-    foreach ($ide in $ides) {
-        $st = Get-IdeGitAuthSetting -SettingsPath $ide.Path
-        if ($st -ne "false") {
-            $needHint = $true
-            $pendingIdes += $ide
-            $ideNames += $ide.Name
-        }
-    }
-    if (-not $needHint -and $ides.Count -eq 0 -and (Test-InsideGitRepo)) {
-        $originUrl = git remote get-url origin 2>$null
-        if ($originUrl) {
-            $info = Get-GitHubRemoteInfo -Url $originUrl
-            if ($info.Type -eq "https") {
-                $needHint = $true
-                $ideNames = @("VS Code", "Cursor", "Antigravity")
-            }
-        }
-    }
-    if ($needHint) {
-        $list = $ideNames -join ", "
-        Write-Color "`n   [TIP] IDE Sync ($list):" -Color Yellow
-        Write-Color "         IDE GitHub extension uses its own OAuth session for UI Push/Pull." -Color Gray
-        if ($Mode -eq "prompt" -and $pendingIdes.Count -gt 0) {
-            $doDisable = Read-Host "   Disable `"github.gitAuthentication`" for $list now so UI Push uses git-switch? [Y/n]"
-            if ($doDisable -match '^(n|no)$') {
-                Write-Color "   [INFO] Skipped. You can configure this anytime in Settings -> [6] IDE Git Auth Sync." -Color Gray
-            } else {
-                foreach ($ide in $pendingIdes) {
-                    if (Set-IdeGitAuthSetting -SettingsPath $ide.Path -DesiredValue $false) {
-                        Write-Color "   [✔] $($ide.Name): Set `"github.gitAuthentication`": false" -Color Green
-                    } else {
-                        Write-Color "   [X] $($ide.Name): Failed to update $($ide.Path)" -Color Red
-                    }
-                }
-            }
-        } else {
-            Write-Color "         Set `"github.gitAuthentication`": false in IDE settings.json to share" -Color Gray
-            Write-Color "         credentials with git-switch (or use Settings -> [6] IDE Git Auth Sync)." -Color Gray
-        }
-    }
-}
-
 # -------------------------- FEATURE FUNCTIONS --------------------------
 function Test-Connection-Action {
     $Profiles = @(Load-Profiles)
     if ($Profiles.Count -eq 0) { Write-Color "`n  [!] No profiles found." "Yellow"; return }
 
-    Write-Host "`n"
-    Draw-Border-Top 60 "Magenta"
-    Draw-Line "TEST GITHUB CONNECTION" 60 "Magenta" "White"
-    Draw-Separator 60 "Magenta"
-    
-    for ($i = 0; $i -lt $Profiles.Count; $i++) {
-        $Text = "  [$($i+1)] $($Profiles[$i].alias)"
-        Draw-Line $Text 60 "Magenta" "White"
+    $items = @()
+    foreach ($p in $Profiles) {
+        $items += ("{0,-15} {1}" -f $p.alias, $p.userEmail)
     }
-    Draw-Border-Bottom 60 "Magenta"
+    $items += "← Back"
 
-    $Choice = Read-Host "  Select ID to test (0 to cancel)"
-    if ($Choice -eq "0" -or -not ($Choice -as [int])) { return }
-    $Idx = [int]$Choice - 1
+    $Idx = Select-ArrowMenu -Title "TEST GITHUB CONNECTION" -Items $items
     if ($Idx -lt 0 -or $Idx -ge $Profiles.Count) { return }
 
     $Selected = $Profiles[$Idx]
@@ -881,7 +960,11 @@ function Test-GitHub-Connection {
     }
 
     if ($OutputStr -match "successfully authenticated") {
-        Write-Color "   [✔] Connection SUCCESS! You are authenticated." -Color Green
+        if ($OutputStr -match "Hi ([^!]+)!") {
+            Write-Color "   [✔] Connection SUCCESS! Authenticated as: $($Matches[1])" -Color Green
+        } else {
+            Write-Color "   [✔] Connection SUCCESS! You are authenticated." -Color Green
+        }
         return $true
     } else {
         Write-Color "   [X] Connection FAILED." -Color Red
@@ -929,23 +1012,19 @@ function Add-Profile-Action {
     }
     # ---------------------------------------
 
-    $UName = Read-Host "   Enter Git User Name (e.g. John Doe)"
-    $UEmail = Read-Host "   Enter Git Email     (e.g. john@company.com)"
+    $UName = Read-Host "   Git User Name (e.g. John Doe)"
+    $UEmail = Read-Host "   Git Email     (e.g. john@company.com)"
 
     if ([string]::IsNullOrWhiteSpace($UName) -or [string]::IsNullOrWhiteSpace($UEmail)) { 
         Write-Color "   [!] Name and Email are required." "Red"; return 
     }
-
-    $GhUser = Read-Host "   Enter GitHub Username (optional, for HTTPS/gh sync, Enter to skip)"
-    $SecPat = Read-Host "   Enter GitHub HTTPS PAT (optional, hidden, Enter to skip)" -AsSecureString
-    $GhPat = if ($SecPat -and $SecPat.Length -gt 0) { [System.Net.NetworkCredential]::new("", $SecPat).Password } else { "" }
 
     # 1. Generate Key
     $KeyPath = Generate-SSH-Key -Email $UEmail -Alias $Alias
     if (-not $KeyPath) { return }
 
     # 2. Update SSH Config
-    Update-SSH-Config -Alias $Alias -KeyPath $KeyPath
+    Update-SSH-Config -Alias $Alias -KeyPath $KeyPath -Quiet
 
     # 3. Clipboard
     $PubKeyPath = "$KeyPath.pub"
@@ -953,211 +1032,187 @@ function Add-Profile-Action {
         $PubKeyContent = Get-Content $PubKeyPath -Raw
         try {
             Copy-TextToClipboard -Text $PubKeyContent
-            Write-Color "   [✔] Public Key copied to CLIPBOARD!" -Color Green
+            Write-Color "   [✔] Public Key copied to clipboard." -Color Green
         } catch {
             Write-Color "   [!] Could not auto-copy. Please open .pub file manually." -Color Yellow
         }
     }
 
-    # 4. Hướng dẫn & Mở Browser
+    # 4. Instructions & Open Browser
     $PasteKey = if ($IsMacOS) { "Cmd+V" } else { "Ctrl+V" }
-    Write-Host "`n   [ACTION REQUIRED]" -ForegroundColor Yellow
-    Write-Host "   1. I will open GitHub SSH settings now." -ForegroundColor Gray
-    Write-Host "   2. Paste ($PasteKey) and add the key as 'Authentication Key' (for git push)." -ForegroundColor Gray
-    Write-Host "   3. (For Verified commits) Add the SAME key once more with Key type = 'Signing Key'." -ForegroundColor Gray
-    Write-Host "   4. Come back here and press ENTER." -ForegroundColor Gray
+    Write-Host "`n   Add the key on GitHub (opening browser):" -ForegroundColor Yellow
+    Write-Host "   1. Paste ($PasteKey) as 'Authentication Key' (for git push)." -ForegroundColor Gray
+    Write-Host "   2. (Optional, for Verified badge) Add the same key as 'Signing Key'." -ForegroundColor Gray
+    Write-Host "   3. Return here and press ENTER." -ForegroundColor Gray
     
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 1
     Open-Target "https://github.com/settings/ssh/new"
     
-    Read-Host "`n   Press ENTER after you have added the key on GitHub..."
+    Read-Host "`n   Press ENTER after adding the key on GitHub..."
 
     # 5. Test Connection
     $null = Test-GitHub-Connection -Alias $Alias
 
-    # 6. Save Profile (& optional HTTPS PAT)
+    # 6. Save Profile
     $NewProfile = [PSCustomObject]@{
         alias = $Alias
         userName = $UName
         userEmail = $UEmail
         keyPath = $KeyPath
-        githubUsername = $GhUser
+        githubUsername = ""
         created = (Get-Date).ToString("yyyy-MM-dd HH:mm")
     }
     $Profiles += $NewProfile
     Save-Profiles $Profiles
-    if (-not [string]::IsNullOrWhiteSpace($GhPat)) {
-        Save-ProfileToken -Alias $Alias -Token $GhPat
-        Write-Color "   [✔] Saved HTTPS PAT securely." -Color Green
-    }
-    Write-Color "`n   [✔] Profile '$Alias' saved successfully!" -Color Green
+    Write-Color "`n   [✔] Account '$Alias' saved!" -Color Green
 
-    # ==========================================================================
-    # LOGIC MỚI: Tự động set Global Config nếu hiện tại đang là "Not Set"
-    # ==========================================================================
     $Curr = Get-Git-Current
     if ($Curr.Name -eq "Not Set" -or $Curr.Name -eq $null) {
-        Sync-Git-Identity -UserName $UName -UserEmail $UEmail -KeyPath $KeyPath
-        Sync-HttpsCredentials -Alias $Alias -GitHubUser $GhUser -FallbackUser $UName
-        Write-Color "   [INFO] Auto-set as Global Git Config (was previously unset)." -Color Cyan
+        Apply-ProfileIndex -Index ($Profiles.Count - 1)
+    } else {
+        $Active = Get-ActiveProfile -Profiles $Profiles
+        if ($Active) {
+            Sync-GlobalGitHubRouting -Alias $Active.alias -KeyPath $Active.keyPath
+        }
     }
 }
 
-function Switch-Profile-Action {
+function Apply-ProfileIndex {
+    param([int]$Index)
     $Profiles = @(Load-Profiles)
-    if ($Profiles.Count -eq 0) { Write-Color "`n   [!] No profiles. Add one first." "Yellow"; return }
+    if ($Index -lt 0 -or $Index -ge $Profiles.Count) { return }
 
-    Write-Host "`n"
-    Draw-Header "SWITCH PROFILE"
-    
-    # Header cột (Màu tối để làm nền)
-    $Format = "     [{0}] {1,-15} {2}"
-    Write-Host ($Format -f "#", "ALIAS", "EMAIL") -ForegroundColor DarkGray
-    
-    # Danh sách Profile
-    for ($i = 0; $i -lt $Profiles.Count; $i++) {
-        $patTag = if (Test-ProfileHasToken -Alias $Profiles[$i].alias) { " [PAT]" } else { "" }
-        Write-Host ($Format -f ($i+1), $Profiles[$i].alias, "$($Profiles[$i].userEmail)$patTag") -ForegroundColor White
-    }
-    Draw-Sep
+    $Selected = $Profiles[$Index]
 
-    $Choice = Read-Host "   Choose ID (0 to cancel)"
-    
-    # Validate Input
-    if ($Choice -eq "0" -or -not ($Choice -as [int])) { return }
-    $Idx = [int]$Choice - 1
-    if ($Idx -lt 0 -or $Idx -ge $Profiles.Count) { return }
+    # 1. Global identity + SSH signing + clear stale local overrides
+    Sync-Git-Identity -UserName $Selected.userName -UserEmail $Selected.userEmail -KeyPath $Selected.keyPath -Quiet
 
-    $Selected = $Profiles[$Idx]
-    
-    Write-Color "`n   [INFO] Switching to '$($Selected.alias)'..." -Color Cyan
-    
-    # 1. Change Global & Local Config (+ Auto SSH Signing Key)
-    Sync-Git-Identity -UserName $Selected.userName -UserEmail $Selected.userEmail -KeyPath $Selected.keyPath
+    # 2. Self-heal ~/.ssh/config
+    Ensure-SshReady -Alias $Selected.alias -KeyPath $Selected.keyPath
 
-    # 2. Swap/Clear HTTPS Credential (Git credential helper / gh CLI)
-    Sync-HttpsCredentials -Alias $Selected.alias -GitHubUser $Selected.githubUsername -FallbackUser $Selected.userName
-    
-    # 3. Detect & Update Repo Remote URL (HTTPS vs SSH)
-    Update-Repo-Url -Alias $Selected.alias
+    # 3. Global multi-repo GitHub routing (~/.git-switch/active.gitconfig)
+    Sync-GlobalGitHubRouting -Alias $Selected.alias -KeyPath $Selected.keyPath
 
-    # 4. Offer to update author & re-sign unpushed local commits
+    # 4. Sync/clear HTTPS credentials & gh CLI silently
+    Sync-HttpsCredentials -Alias $Selected.alias -GitHubUser $Selected.githubUsername -FallbackUser $Selected.userName -Quiet
+
+    # 5. Clean embedded-username or orphaned-alias remotes in current repo
+    Clear-EmbeddedHttpsRemote -Alias $Selected.alias
+
+    # 6. Offer to fix unpushed commits only if any have wrong author/signature
     Invoke-FixUnpushedCommits -TargetName $Selected.userName -TargetEmail $Selected.userEmail
 
-    # 5. Test SSH (Để đảm bảo key hoạt động tốt)
-    if ($Selected.keyPath) {
-        $null = Test-GitHub-Connection -Alias $Selected.alias
-    }
-
-    # 6. Inline IDE Git Auth Sync (1-press disable if enabled)
-    Show-IdeSyncHint -Mode "prompt"
-
-    Write-Color "`n   [✔] Switched successfully!" -Color Green
-    Write-Color "       Global User : $($Selected.userName)" -Color Gray
-    Write-Color "       Global Email: $($Selected.userEmail)" -Color Gray
-    if (Test-InsideGitRepo) {
-        Write-Color "       Local Repo  : Synced to $($Selected.userName) <$($Selected.userEmail)>" -Color Gray
-    }
+    $script:StatusMsg = "✔ Switched to $($Selected.alias) ($($Selected.userName) <$($Selected.userEmail)>)"
+    $script:StatusColor = "Green"
 }
 
 function Remove-Profile-Action {
     $Profiles = @(Load-Profiles)
-    if ($Profiles.Count -eq 0) { Write-Color "`n   [!] No profiles to remove." "Yellow"; return }
+    if ($Profiles.Count -eq 0) { Write-Color "`n   [!] No accounts to remove." "Yellow"; return }
 
-    Write-Host "`n"
-    Draw-Header "REMOVE PROFILE"
-    
-    # Hiển thị danh sách rõ ràng (Có cả Email)
-    $Format = "     [{0}] {1,-15} {2}"
-    Write-Host ($Format -f "#", "ALIAS", "EMAIL") -ForegroundColor DarkGray
-    
-    for ($i = 0; $i -lt $Profiles.Count; $i++) {
-        $patTag = if (Test-ProfileHasToken -Alias $Profiles[$i].alias) { " [PAT]" } else { "" }
-        Write-Host ($Format -f ($i+1), $Profiles[$i].alias, "$($Profiles[$i].userEmail)$patTag") -ForegroundColor White
+    $items = @()
+    foreach ($p in $Profiles) {
+        $items += ("{0,-15} {1}" -f $p.alias, $p.userEmail)
     }
-    Draw-Sep
+    $items += "← Back"
 
-    $Choice = Read-Host "   Select ID to remove (0 to cancel)"
-    
-    # Validate Input
-    if ($Choice -eq "0" -or -not ($Choice -as [int])) { return }
-    $Idx = [int]$Choice - 1
+    $Idx = Select-ArrowMenu -Title "REMOVE ACCOUNT" -Items $items
     if ($Idx -lt 0 -or $Idx -ge $Profiles.Count) { return }
 
     $Removed = $Profiles[$Idx]
+    $PrevActive = Get-ActiveProfile -Profiles $Profiles
+    $PrevActiveAlias = if ($PrevActive) { $PrevActive.alias } else { "" }
     
-    Write-Color "`n   [WARNING] Deleting profile '$($Removed.alias)'..." "Red"
+    Write-Color "`n   Deleting '$($Removed.alias)' ($($Removed.userEmail))..." "Red"
     $Confirm = Read-Host "   Type 'DELETE' to confirm"
     if ($Confirm -ne "DELETE") { return }
 
     # 1. Remove SSH Keys
     if ($Removed.keyPath) {
-        if (Test-Path $Removed.keyPath) { Remove-Item $Removed.keyPath -Force; Write-Color "   [✔] Private Key deleted." "Gray" }
-        if (Test-Path "$($Removed.keyPath).pub") { Remove-Item "$($Removed.keyPath).pub" -Force; Write-Color "   [✔] Public Key deleted." "Gray" }
+        if (Test-Path $Removed.keyPath) { Remove-Item $Removed.keyPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path "$($Removed.keyPath).pub") { Remove-Item "$($Removed.keyPath).pub" -Force -ErrorAction SilentlyContinue }
     }
 
     # 2. Remove from SSH Config & Saved HTTPS PAT
-    Remove-From-SSH-Config -Alias $Removed.alias
-    if (Test-ProfileHasToken -Alias $Removed.alias) {
-        Remove-ProfileToken -Alias $Removed.alias
-        Write-Color "   [✔] Saved HTTPS PAT deleted." "Gray"
-    }
+    Remove-From-SSH-Config -Alias $Removed.alias -Quiet
+    Remove-ProfileToken -Alias $Removed.alias
 
     # 3. Remove from JSON
     $NewProfiles = @($Profiles | Where-Object { $_.alias -ne $Removed.alias })
-    
     if ($NewProfiles.Count -eq 0) {
         "[]" | Set-Content $ProfilesFile -Encoding UTF8
     } else {
         Save-Profiles $NewProfiles
     }
 
-    # 4. Check & Clear Global/Local Config, Signing Key, and Cached HTTPS Credential
+    # 4. Check & Clear Global/Local Config, Routing, Signing Key, and Cached HTTPS Credential
     $Curr = Get-Git-Current
-    if ($Curr.Name -eq $Removed.userName -or $Curr.Email -eq $Removed.userEmail) {
+    if ($PrevActiveAlias -eq $Removed.alias -or ([string]::IsNullOrWhiteSpace($PrevActiveAlias) -and ($Curr.Name -eq $Removed.userName -or $Curr.Email -eq $Removed.userEmail))) {
         git config --global --unset user.name 2>$null
         git config --global --unset user.email 2>$null
+        Clear-GlobalGitHubRouting
         Clear-GitHubHttpsCredential
-        Write-Color "   [INFO] Current Global Git config & cached HTTPS credential cleared because profile was removed." "Cyan"
+    } else {
+        $Active = Get-ActiveProfile -Profiles $NewProfiles
+        if ($Active) {
+            Sync-GlobalGitHubRouting -Alias $Active.alias -KeyPath $Active.keyPath
+        }
     }
     $currSKey = git config --global user.signingkey 2>$null
     if ($Removed.keyPath -and $currSKey -eq "$($Removed.keyPath).pub") {
         git config --global --unset user.signingkey 2>$null
+        git config --global --unset commit.gpgsign 2>$null
     }
     if (Test-InsideGitRepo) {
         $localEmail = git config --local user.email 2>$null
         if ($localEmail -eq $Removed.userEmail) {
             git config --local --unset user.name 2>$null
             git config --local --unset user.email 2>$null
-            Write-Color "   [INFO] Local repo Git config cleared because profile was removed." "Cyan"
         }
         $localSKey = git config --local user.signingkey 2>$null
         if ($Removed.keyPath -and $localSKey -eq "$($Removed.keyPath).pub") {
             git config --local --unset user.signingkey 2>$null
+            git config --local --unset commit.gpgsign 2>$null
         }
     }
 
-    Write-Color "   [✔] Profile removed successfully." "Green"
+    $script:StatusMsg = "✔ Removed account '$($Removed.alias)'."
+    $script:StatusColor = "Green"
+    Write-Color "   [✔] Account '$($Removed.alias)' removed." "Green"
+}
+
+function Toggle-SshRewrite {
+    if (Test-SshRewriteEnabled) {
+        New-Item -ItemType File -Path $NoSshRewriteFlag -Force | Out-Null
+        Clear-GlobalGitHubRouting
+        Write-Color "   [✔] Auto-Route GitHub HTTPS -> SSH disabled (using raw repo remotes / HTTPS PAT)." "Yellow"
+    } else {
+        if (Test-Path $NoSshRewriteFlag) { Remove-Item $NoSshRewriteFlag -Force -ErrorAction SilentlyContinue }
+        $Active = Get-ActiveProfile
+        if ($Active) {
+            Sync-GlobalGitHubRouting -Alias $Active.alias -KeyPath $Active.keyPath
+        }
+        Write-Color "   [✔] Auto-Route GitHub HTTPS -> SSH enabled (all repos push as active account)." "Green"
+    }
 }
 
 function Toggle-SSH-Signing {
     if (Test-CommitSigningEnabled) {
         git config --global commit.gpgsign false
-        if (Test-InsideGitRepo) { git config --local --unset commit.gpgsign 2>$null }
+        if (Test-InsideGitRepo) { git config --local --unset-all commit.gpgsign 2>$null }
         Write-Color "   [✔] SSH Commit Signing disabled (commit.gpgsign = false)." "Yellow"
     } else {
         git config --global gpg.format ssh
         git config --global commit.gpgsign true
-        $Curr = Get-Git-Current
-        $Profiles = @(Load-Profiles)
-        $Matched = $Profiles | Where-Object { $_.userEmail -eq $Curr.Email -and $_.keyPath } | Select-Object -First 1
-        if ($Matched -and (Test-Path "$($Matched.keyPath).pub")) {
+        if (Test-InsideGitRepo) {
+            git config --local --unset-all gpg.format 2>$null
+            git config --local --unset-all user.signingkey 2>$null
+            git config --local --unset-all commit.gpgsign 2>$null
+        }
+        $Matched = Get-ActiveProfile
+        if ($Matched -and $Matched.keyPath -and (Test-Path "$($Matched.keyPath).pub")) {
             $pubKey = "$($Matched.keyPath).pub"
             git config --global user.signingkey "$pubKey"
-            if (Test-InsideGitRepo) {
-                git config --local gpg.format ssh
-                git config --local user.signingkey "$pubKey"
-            }
             Write-Color "   [✔] SSH Commit Signing enabled with key: $pubKey" "Green"
         } else {
             Write-Color "   [✔] SSH Commit Signing enabled (switch a profile to assign signing key)." "Green"
@@ -1231,6 +1286,10 @@ function Manage-HttpsCredentials-Action {
             $Curr = Get-Git-Current
             if ($Curr.Email -eq $Sel.userEmail) {
                 Sync-HttpsCredentials -Alias $Sel.alias -GitHubUser $newGh -FallbackUser $Sel.userName
+            }
+            $Active = Get-ActiveProfile -Profiles $Profiles
+            if ($Active) {
+                Sync-GlobalGitHubRouting -Alias $Active.alias -KeyPath $Active.keyPath
             }
         }
         "2" {
@@ -1310,144 +1369,292 @@ function Sync-IdeGitAuth-Action {
     }
 }
 
-function Show-Settings-Action {
-    Write-Host "`n"
-    Draw-Header "SETTINGS & TOOLS"
-
-    $SignState = if (Test-CommitSigningEnabled) { "ON" } else { "OFF" }
-    Write-Host "     [1] Open profiles.json (View/Edit DB)"
-    Write-Host "     [2] Backup Profiles (Create snapshot)"
-    Write-Host "     [3] Open .ssh folder (View Keys)"
-    Write-Host "     [4] Toggle SSH Commit Signing (Currently: $SignState)"
-    Write-Host "     [5] Manage HTTPS Credentials (PAT / Keychain)"
-    Write-Host "     [6] IDE Git Auth Sync (github.gitAuthentication)"
-    Write-Host "     [0] Back"
-    
-    Draw-Sep
-
-    $Opt = Read-Host "   Choose"
-    switch ($Opt) {
-        "1" { Open-Target $ProfilesFile }
-        "2" { 
-            $Bak = Join-Path $BaseDir "backup_$(Get-Date -Format 'yyyyMMdd_HHmm').json"
-            Copy-Item $ProfilesFile $Bak
-            Write-Color "   [✔] Backup created: $Bak" "Green"
+# -------------------------- ARROW-KEY TUI HELPERS --------------------------
+function Read-NavKey {
+    try {
+        $k = [Console]::ReadKey($true)
+        switch ($k.Key) {
+            "UpArrow"   { return "UP" }
+            "DownArrow" { return "DOWN" }
+            "Enter"     { return "ENTER" }
+            "Escape"    { return "ESC" }
+            default {
+                $ch = $k.KeyChar.ToString()
+                if ($ch -eq "k" -or $ch -eq "K") { return "UP" }
+                if ($ch -eq "j" -or $ch -eq "J") { return "DOWN" }
+                if ($ch -eq "q" -or $ch -eq "Q" -or $ch -eq "0") { return "ESC" }
+                return $ch
+            }
         }
-        "3" { Open-Target $SSHDir }
-        "4" { Toggle-SSH-Signing }
-        "5" { Manage-HttpsCredentials-Action }
-        "6" { Sync-IdeGitAuth-Action }
+    } catch {
+        $line = Read-Host
+        if ([string]::IsNullOrEmpty($line)) { return "ENTER" }
+        return $line
+    }
+}
+
+function Select-ArrowMenu {
+    param([string]$Title, [string[]]$Items)
+    if (-not $Items -or $Items.Count -eq 0) { return -1 }
+    $selected = 0
+    $origCursor = $true
+    try { $origCursor = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch {}
+    try {
+        while ($true) {
+            Clear-Host
+            Write-Host ""
+            Draw-Header $Title
+            Write-Host ""
+            for ($i = 0; $i -lt $Items.Count; $i++) {
+                if ($i -eq $selected) {
+                    Write-Host ("   ❯ {0}" -f $Items[$i]) -ForegroundColor Cyan
+                } else {
+                    Write-Host ("     {0}" -f $Items[$i]) -ForegroundColor Gray
+                }
+            }
+            Write-Host ""
+            Write-Host "   ↑/↓ Move   Enter Select   Esc Back" -ForegroundColor DarkGray
+
+            $key = Read-NavKey
+            switch ($key) {
+                "UP"    { $selected = ($selected - 1 + $Items.Count) % $Items.Count }
+                "DOWN"  { $selected = ($selected + 1) % $Items.Count }
+                "ENTER" { return $selected }
+                "ESC"   { return -1 }
+            }
+        }
+    } finally {
+        try { [Console]::CursorVisible = $origCursor } catch {}
+    }
+}
+
+function Show-Settings-Action {
+    $selected = 0
+    $origCursor = $true
+    try { $origCursor = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch {}
+    try {
+        while ($true) {
+            $RouteState = if (Test-SshRewriteEnabled) { "ON" } else { "OFF" }
+            $SignState = if (Test-CommitSigningEnabled) { "ON" } else { "OFF" }
+            $items = @(
+                "Auto-Route GitHub HTTPS -> SSH  [$RouteState]",
+                "SSH Commit Signing              [$SignState]",
+                "Manage HTTPS Credentials (PAT)",
+                "IDE Git Auth Sync (github.gitAuthentication)",
+                "Backup Profiles",
+                "Open profiles.json",
+                "Open .ssh folder",
+                "← Back"
+            )
+
+            Clear-Host
+            Write-Host ""
+            Draw-Header "SETTINGS"
+            Write-Host ""
+            for ($i = 0; $i -lt $items.Count; $i++) {
+                if ($i -eq $selected) {
+                    Write-Host ("   ❯ {0}" -f $items[$i]) -ForegroundColor Cyan
+                } else {
+                    Write-Host ("     {0}" -f $items[$i]) -ForegroundColor Gray
+                }
+            }
+            Write-Host ""
+            Write-Host "   ↑/↓ Move   Enter Select   Esc Back" -ForegroundColor DarkGray
+
+            $key = Read-NavKey
+            switch ($key) {
+                "UP"   { $selected = ($selected - 1 + $items.Count) % $items.Count }
+                "DOWN" { $selected = ($selected + 1) % $items.Count }
+                "ESC"  { return }
+                "ENTER" {
+                    try { [Console]::CursorVisible = $origCursor } catch {}
+                    switch ($selected) {
+                        0 { Toggle-SshRewrite }
+                        1 { Toggle-SSH-Signing }
+                        2 { Manage-HttpsCredentials-Action; Wait-KeyPress }
+                        3 { Sync-IdeGitAuth-Action; Wait-KeyPress }
+                        4 {
+                            $Bak = Join-Path $BaseDir "backup_$(Get-Date -Format 'yyyyMMdd_HHmm').json"
+                            Copy-Item $ProfilesFile $Bak
+                            Write-Color "`n   [✔] Backup created: $Bak" "Green"
+                            Wait-KeyPress
+                        }
+                        5 { Open-Target $ProfilesFile }
+                        6 { Open-Target $SSHDir }
+                        7 { return }
+                    }
+                    try { [Console]::CursorVisible = $false } catch {}
+                }
+            }
+        }
+    } finally {
+        try { [Console]::CursorVisible = $origCursor } catch {}
     }
 }
 
 
 # -------------------------- MAIN UI --------------------------
 
-function Show-Banner {
-    $Art = @"
-      ██████  ██ ████████     ███████ ██     ██ ██ ████████  ██████  ██   ██
-     ██       ██    ██        ██      ██     ██ ██    ██    ██       ██   ██
-     ██   ███ ██    ██        ███████ ██  █  ██ ██    ██    ██       ███████
-     ██    ██ ██    ██             ██ ██ ███ ██ ██    ██    ██       ██   ██
-      ██████  ██    ██        ███████  ███ ███  ██    ██     ██████  ██   ██
-"@
-    Write-Host $Art -ForegroundColor Magenta
-    Draw-Sep
-    
+function Show-Home {
+    param([int]$SelectedIndex = 0)
+
     $Curr = Get-Git-Current
-    Write-Host "   » GIT PROFILE MANAGEMENT SYSTEM [v2.3]" -ForegroundColor White
-    Draw-Sep
-    
-    if ($IsWinOS) {
-        $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        
-        if ($IsAdmin) {
-            Write-Color "   [✔] STATUS: Running as Administrator" -Color Green
-        } else {
-            Write-Color "   [!] STATUS: Running as Standard User (Restrictions may apply)" -Color Yellow
+    $Profiles = @(Load-Profiles)
+    $Active = Get-ActiveProfile -Profiles $Profiles
+    $ActiveAlias = if ($Active) { $Active.alias } else { "" }
+
+    # Auto-heal global routing if active profile is set (e.g. upgraded from v2.3.0)
+    Ensure-ActiveRoutingSynced -ActiveProfile $Active
+
+    $hasLocalOverride = $false
+    $LocalName = ""
+    $LocalEmail = ""
+    if (Test-InsideGitRepo) {
+        $LocalName = git config --local user.name 2>$null
+        $LocalEmail = git config --local user.email 2>$null
+        if (($LocalEmail -and $LocalEmail -ne $Curr.Email) -or ($LocalName -and $LocalName -ne $Curr.Name)) {
+            $hasLocalOverride = $true
         }
-    } else {
-        $OsLabel = if ($IsMacOS) { "macOS" } else { "Linux" }
-        Write-Color "   [✔] STATUS: Running on $OsLabel ($env:USER)" -Color Green
     }
 
-    Write-Host "   [●] CURRENT: " -NoNewline -ForegroundColor Cyan
-    Write-Host "$($Curr.Name) " -NoNewline -ForegroundColor White
-    Write-Host "<$($Curr.Email)>" -ForegroundColor DarkGray
+    Write-Host ""
+    Draw-Border-Top 62 "Cyan"
+    Draw-Line "git-switch v2.5" 62 "Cyan" "White"
+    if ($hasLocalOverride) {
+        $dName = if ($LocalName) { $LocalName } else { $Curr.Name }
+        $dEmail = if ($LocalEmail) { $LocalEmail } else { $Curr.Email }
+        Draw-Line "! Pushing as: $dName <$dEmail> (local)" 62 "Cyan" "Yellow"
+    } elseif ($Curr.Name -eq "Not Set" -and $Curr.Email -eq "Not Set") {
+        Draw-Line "Pushing as: (not set)" 62 "Cyan" "Yellow"
+    } elseif ($ActiveAlias) {
+        Draw-Line "● Pushing as: $ActiveAlias ($($Curr.Name) <$($Curr.Email)>)" 62 "Cyan" "Green"
+    } else {
+        Draw-Line "● Pushing as: $($Curr.Name) <$($Curr.Email)>" 62 "Cyan" "Green"
+    }
+    Draw-Border-Bottom 62 "Cyan"
+
+    if ($hasLocalOverride) {
+        Write-Color "  [!] Local repo config overrides global — select account to sync" -Color Yellow
+    }
 
     if (Test-InsideGitRepo) {
-        $LocalEmail = git config --local user.email 2>$null
-        $LocalName = git config --local user.name 2>$null
-        if ($LocalEmail -and $LocalEmail -ne $Curr.Email) {
-            $DispName = if ($LocalName) { $LocalName } else { $Curr.Name }
-            Write-Color "   [!] LOCAL OVERRIDE: $DispName <$LocalEmail> (Switch to sync)" -Color Yellow
-        }
-
-        $OriginUrl = git remote get-url origin 2>$null
-        if ($OriginUrl) {
+        $OriginUrl = git remote get-url --push origin 2>$null
+        if (-not $OriginUrl) { $OriginUrl = git remote get-url origin 2>$null }
+        if ($OriginUrl -and $ActiveAlias) {
             $rinfo = Get-GitHubRemoteInfo -Url $OriginUrl
-            switch ($rinfo.Type) {
-                "https" {
-                    Write-Color "   [!] REMOTE (HTTPS): $OriginUrl (SSH config ignored; switch to convert/PAT)" -Color Yellow
+            if ($rinfo.Type -eq "ssh_alias" -and $rinfo.SshAlias -ne $ActiveAlias) {
+                Write-Color "  [!] Repo remote uses '$($rinfo.SshAlias)' instead of '$ActiveAlias' — select account to sync" -Color Yellow
+            } elseif (($rinfo.Type -eq "https" -or $rinfo.Type -eq "ssh_default") -and (Test-SshRewriteEnabled)) {
+                Write-Color "  [!] Repo remote not yet routed to '$ActiveAlias' — select account to sync" -Color Yellow
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:StatusMsg)) {
+        Write-Color "  $($script:StatusMsg)" -Color $script:StatusColor
+    }
+
+    Write-Host ""
+    Write-Host "  ACCOUNTS" -ForegroundColor DarkGray
+    if ($Profiles.Count -eq 0) {
+        Write-Host "    (no accounts yet — select '+ Add account' below)" -ForegroundColor Gray
+    } else {
+        for ($i = 0; $i -lt $Profiles.Count; $i++) {
+            $p = $Profiles[$i]
+            $isActive = ($ActiveAlias -and $p.alias -eq $ActiveAlias -and -not $hasLocalOverride)
+            $badge = if ($isActive) { " (active)" } else { "" }
+            if ($i -eq $SelectedIndex) {
+                if ($isActive) {
+                    Write-Host ("  ❯ ● {0,-15} " -f $p.alias) -NoNewline -ForegroundColor Cyan
+                    Write-Host $p.userEmail -NoNewline -ForegroundColor White
+                    Write-Host $badge -ForegroundColor Green
+                } else {
+                    Write-Host ("  ❯   {0,-15} " -f $p.alias) -NoNewline -ForegroundColor Cyan
+                    Write-Host $p.userEmail -ForegroundColor White
                 }
-                "ssh_default" {
-                    Write-Color "   [!] REMOTE (SSH): $OriginUrl (No profile alias; switch to bind)" -Color Yellow
-                }
-                "ssh_alias" {
-                    $Profiles = @(Load-Profiles)
-                    $Active = $Profiles | Where-Object { $_.userEmail -eq $Curr.Email } | Select-Object -First 1
-                    if ($Active -and $rinfo.SshAlias -ne $Active.alias) {
-                        Write-Color "   [!] REMOTE (SSH): github.com-$($rinfo.SshAlias) != active '$($Active.alias)' (Switch to sync)" -Color Yellow
-                    } else {
-                        Write-Color "   [✔] REMOTE (SSH): $OriginUrl" -Color Green
-                    }
+            } else {
+                if ($isActive) {
+                    Write-Host ("    ● {0,-15} " -f $p.alias) -NoNewline -ForegroundColor Green
+                    Write-Host $p.userEmail -NoNewline -ForegroundColor DarkGray
+                    Write-Host $badge -ForegroundColor Green
+                } else {
+                    Write-Host ("      {0,-15} " -f $p.alias) -NoNewline -ForegroundColor White
+                    Write-Host $p.userEmail -ForegroundColor DarkGray
                 }
             }
         }
     }
 
-    if (Test-CommitSigningEnabled) {
-        $SKey = git config --get user.signingkey 2>$null
-        if ($SKey) {
-            $KeyName = Split-Path $SKey -Leaf
-            Write-Color "   [✔] SSH SIGNING: ON ($KeyName)" -Color Green
+    Write-Host ""
+    Write-Host "  ACTIONS" -ForegroundColor DarkGray
+    $actions = @("+ Add account", "- Remove account", "✓ Test connection", "⚙ Settings", "× Exit")
+    for ($a = 0; $a -lt $actions.Count; $a++) {
+        $rowIdx = $Profiles.Count + $a
+        if ($rowIdx -eq $SelectedIndex) {
+            Write-Host ("  ❯ {0}" -f $actions[$a]) -ForegroundColor Cyan
         } else {
-            Write-Color "   [!] SSH SIGNING: ON (no signing key set)" -Color Yellow
+            Write-Host ("    {0}" -f $actions[$a]) -ForegroundColor Gray
         }
     }
-    Draw-Sep
+
+    Write-Host ""
+    Write-Host "  ↑/↓ Move   Enter Select   q Quit" -ForegroundColor DarkGray
 }
 
-function Show-Menu {
-    Write-Host ""
-    Write-Host "   SELECT AN OPTION:" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "     [1] Add New Profile"
-    Write-Host "     [2] Switch Profile"
-    Write-Host "     [3] Remove Profile"
-    Write-Host "     [4] Settings"
-    Write-Host "     [5] Test Connection"
-    Write-Host "     [0] Exit Program"
-    Write-Host ""
-    Draw-Sep
-}
 # ================= MAIN EXECUTION LOOP =================
-$Running = $true
 Initialize-System
+$Running = $true
+$Selected = 0
 
-do {
-    Clear-Host
-    Show-Banner
-    Show-Menu
-    $Selection = Read-Host "  Choose an option (0-5)"
-
-    switch ($Selection) {
-        "1" { Add-Profile-Action; Wait-KeyPress }
-        "2" { Switch-Profile-Action; Wait-KeyPress }
-        "3" { Remove-Profile-Action; Wait-KeyPress }
-        "4" { Show-Settings-Action; Wait-KeyPress }
-        "5" { Test-Connection-Action; Wait-KeyPress }
-        "0" { $Running = $false; Write-Color "`n  Goodbye! 👋" "Magenta" }
-        default { Write-Color "  Invalid option." "Red"; Start-Sleep -Milliseconds 500 }
+$InitProfiles = @(Load-Profiles)
+$InitActive = Get-ActiveProfile -Profiles $InitProfiles
+if ($InitActive) {
+    for ($i = 0; $i -lt $InitProfiles.Count; $i++) {
+        if ($InitProfiles[$i].alias -eq $InitActive.alias) { $Selected = $i; break }
     }
-} while ($Running)
+}
+
+$OrigCursorVisible = $true
+try { $OrigCursorVisible = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch {}
+try {
+    while ($Running) {
+        $Profiles = @(Load-Profiles)
+        $Total = $Profiles.Count + 5
+        if ($Selected -ge $Total) { $Selected = $Total - 1 }
+
+        Clear-Host
+        Show-Home -SelectedIndex $Selected
+
+        $Key = Read-NavKey
+        $script:StatusMsg = ""
+        $script:StatusColor = "Green"
+
+        switch ($Key) {
+            "UP"   { $Selected = ($Selected - 1 + $Total) % $Total }
+            "DOWN" { $Selected = ($Selected + 1) % $Total }
+            "ESC"  { $Running = $false }
+            "ENTER" {
+                try { [Console]::CursorVisible = $OrigCursorVisible } catch {}
+                if ($Selected -lt $Profiles.Count) {
+                    $script:NeedPause = $false
+                    Apply-ProfileIndex -Index $Selected
+                    if ($script:NeedPause) { Wait-KeyPress }
+                } else {
+                    $act = $Selected - $Profiles.Count
+                    switch ($act) {
+                        0 { Add-Profile-Action; Wait-KeyPress }
+                        1 { Remove-Profile-Action; Wait-KeyPress }
+                        2 { Test-Connection-Action; Wait-KeyPress }
+                        3 { Show-Settings-Action }
+                        4 { $Running = $false }
+                    }
+                }
+                if ($Running) {
+                    try { [Console]::CursorVisible = $false } catch {}
+                }
+            }
+        }
+    }
+} finally {
+    try { [Console]::CursorVisible = $OrigCursorVisible } catch {}
+}
