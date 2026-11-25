@@ -12,30 +12,27 @@
 
 - **Cross-Platform:** Native Bash support for **macOS / Linux** (`git.sh`) and PowerShell support for **Windows** (`git.ps1`).
 - **Instant Switching:** Changes Git identity (`user.name`, `user.email`) and SSH keys immediately for both global and local repositories.
-- **SSH Auto-Generation:** Automatically creates SSH key pairs, configures `~/.ssh/config` (with macOS Keychain support), and registers with `ssh-agent`.
+- **SSH Auto-Generation & Commit Signing:** Automatically creates SSH key pairs, configures `~/.ssh/config` (with macOS Keychain support), registers with `ssh-agent`, and syncs SSH commit signing keys.
+- **HTTPS Credential Swap (PAT / Keychain / `gh`):** Securely stores per-profile GitHub Personal Access Tokens (`chmod 600` outside `profiles.json`), swaps or clears cached `github.com` HTTPS credentials in `osxkeychain` / Git credential helper on switch, and switches `gh` CLI accounts when installed.
+- **Remote HTTPS vs SSH Detection:** Automatically detects whether `origin` uses HTTPS (which bypasses `~/.ssh/config`) or SSH, warns on the status banner, and prompts to convert HTTPS remotes to the profile's SSH alias (`git@github.com-<alias>:...`).
+- **IDE Git Auth Sync (VS Code / Cursor / Antigravity):** Detects IDE `settings.json` and helps disable `"github.gitAuthentication": false` so IDE UI Push/Pull uses `git-switch` credentials instead of a separate IDE OAuth session.
 - **Smart Clipboard:** Auto-copies public keys (`pbcopy` on macOS, `Set-Clipboard` on Windows) and opens GitHub SSH settings page for seamless key addition.
-- **Remote URL Sync:** Automatically updates repository remote URLs to match the active profile's SSH host alias.
 - **Isolated Identities:** Complete separation between Work, Personal, and any custom profiles.
 - **Beautiful UI:** Clean, intuitive interface with color-coded status indicators and box-drawing characters.
 
-## Quick Start (Run without installing)
+## Quick Start
 
-### macOS / Linux
+Install globally via npm (works on **macOS, Linux, and Windows**):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nhatprx/git-switch/master/install.sh | bash
-```
-Or run locally after cloning:
-```bash
-chmod +x git.sh
-./git.sh
+npm install -g @nhatprx/gitswitch
 ```
 
-### Windows (PowerShell)
-```powershell
-iwr -useb https://raw.githubusercontent.com/nhatprx/git-switch/master/install.ps1 | iex
+Then run inside any project directory:
+```bash
+gitswitch
 ```
-**Backup:** Universal Command (If Option 1 fails / For older Windows)  
-Use this if you see SSL/TLS errors or Policy restrictions.
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/nhatprx/git-switch/master/install.ps1'))
+
+Or run directly without installing:
+```bash
+npx @nhatprx/gitswitch
 ```

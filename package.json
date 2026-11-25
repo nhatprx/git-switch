@@ -1,0 +1,56 @@
+{
+  "name": "@nhatprx/gitswitch",
+  "version": "2.3.0",
+  "description": "Cross-platform CLI utility to manage multiple Git identities, SSH keys, HTTPS credentials, and IDE Git auth.",
+  "bin": {
+    "gitswitch": "bin/gitswitch.js",
+    "git-switch": "bin/gitswitch.js"
+  },
+  "files": [
+    "bin/",
+    "git.sh",
+    "git.ps1",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node bin/gitswitch.js",
+    "check": "bash -n git.sh && bash -n install.sh && node --check bin/gitswitch.js"
+  },
+  "keywords": [
+    "git",
+    "gitswitch",
+    "git-switch",
+    "git-profile",
+    "ssh",
+    "github",
+    "keychain",
+    "pat",
+    "cli",
+    "macos",
+    "windows"
+  ],
+  "author": "nhatprx",
+  "license": "MIT",
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nhatprx/git-switch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nhatprx/git-switch/issues"
+  },
+  "homepage": "https://github.com/nhatprx/git-switch#readme",
+  "dependencies": {
+    "@nhatprx/gitswitch": "^2.2.0"
+  }
+}
